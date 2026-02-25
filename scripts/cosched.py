@@ -61,6 +61,7 @@ Change shebang to: #!/usr/bin/env /opt/rh/rh-python36/root/usr/bin/python3
 """
 
 import argparse
+import configparser
 import os
 import re
 import shlex
@@ -75,8 +76,10 @@ HEADER = "#  state  pri  satel    telem       date    day    time    durat  post
 TIMEOUT_SECS = 120  # per subprocess call
 LISTSCHED = "/opt/terascan/bin/listsched"   # listsched binary path
 SCHED_DIR = "/tmp"                           # directory for fetched .sched files
+SYSTEM_CONFIG = "/opt/terascan/pass/config/system.config"  # TeraScan system config
 DEFAULT_CHAIN = 1
-TELEMETRY_CHAIN_MAP = {
+
+_FALLBACK_CHAIN_MAP = {
     "aquadb": 1,
     "nppdb": 2,
     "jpssdb": 3,
@@ -84,6 +87,48 @@ TELEMETRY_CHAIN_MAP = {
     "ahrpt": 5,
     "rtd": 6,
 }
+
+
+def load_telemetry_chain_map(path=SYSTEM_CONFIG, default=None):
+    # type: (str, Optional[Dict[str, int]]) -> Dict[str, int]
+    """Build a telemetry-name -> chain-number map from a TeraScan system.config file.
+
+    Reads the INI-format system.config and returns a dict mapping lowercase
+    telemetry names to their integer chain numbers derived from numeric section
+    headers (e.g. ``[1]``, ``[2]``).  Falls back to *default* when the file
+    cannot be read, is missing, or yields no usable entries.
+
+    Args:
+        path: Path to the system.config file (default: SYSTEM_CONFIG).
+        default: Mapping returned when the file is unavailable or empty.
+                 Defaults to _FALLBACK_CHAIN_MAP when not supplied.
+
+    Returns:
+        A dict mapping telemetry name (str, lowercase) -> chain number (int).
+    """
+    if default is None:
+        default = _FALLBACK_CHAIN_MAP
+    try:
+        cfg = configparser.RawConfigParser()
+        cfg.read(path)
+        result = {}  # type: Dict[str, int]
+        for section in cfg.sections():
+            try:
+                chain = int(section)
+            except ValueError:
+                continue  # skip non-numeric sections (e.g. [antenna-1], [system])
+            if cfg.has_option(section, "telemetry.name"):
+                telem = cfg.get(section, "telemetry.name").strip().lower()
+                if telem:
+                    result[telem] = chain
+        return result if result else default
+    except Exception as exc:
+        print("WARNING: could not load telemetry chain map from {}: {}".format(path, exc),
+              file=sys.stderr)
+        return default
+
+
+TELEMETRY_CHAIN_MAP = load_telemetry_chain_map()
 
 class Pass:
     def __init__(
