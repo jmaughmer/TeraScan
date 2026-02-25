@@ -75,7 +75,15 @@ HEADER = "#  state  pri  satel    telem       date    day    time    durat  post
 TIMEOUT_SECS = 120  # per subprocess call
 LISTSCHED = "/opt/terascan/bin/listsched"   # listsched binary path
 SCHED_DIR = "/tmp"                           # directory for fetched .sched files
-
+DEFAULT_CHAIN = 1
+TELEMETRY_CHAIN_MAP = {
+    "aquadb": 1,
+    "nppdb": 2,
+    "jpssdb": 3,
+    "jpss2db": 4,
+    "ahrpt": 5,
+    "rtd": 6,
+}
 
 class Pass:
     def __init__(
@@ -430,18 +438,9 @@ def clear_remote_tschedule(host: Optional[str] = None) -> None:
 
 
 def telemetry_to_chain(telem: str) -> int:
-    """Map telemetry to a TeraScan chain number. Adjust as needed for your site."""
-    mapping = {
-        "teradb": 1,
-        "aquadb": 2,
-        "nppdb": 3,
-        "jpssdb": 4,
-        "mpt": 5,
-        "hrtp": 6,
-        "ahrpt": 7,
-        "rtd": 8
-    }
-    return mapping.get((telem or "").lower(), 1)
+    """Map telemetry to a TeraScan chain number."""
+    key = (telem or "").strip().lower()
+    return TELEMETRY_CHAIN_MAP.get(key, DEFAULT_CHAIN)
 
 
 def build_mansched_args(p: Pass, overrides: Optional[Dict[str, str]] = None) -> List[str]:
