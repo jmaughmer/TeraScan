@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 """
 Co-scheduler: Read one or more satellite schedule files, deduplicate passes, and build
 one or more new schedules maximizing the number of passes while ensuring at least
@@ -29,7 +29,16 @@ Assumptions:
 Usage (file mode):
     cosched.py <input1> [<input2> ...] [--out <path>] [--out <path>] ... \
         [--gap 190] [--max-trim 180] [--max-start-delay 180] \
-        [--remote-host user@host] [--remote-host user@host2] ...
+        [--remote-host user@host] [--remote-host user@host2] ... \
+        [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ...
+
+Satellite exclusion:
+- --exclude-sat SAT        Exclude a satellite from ALL channels (repeat for multiple).
+- --local-exclude-sat SAT  Exclude a satellite from the local channel (channel 1) only.
+- --remote-exclude-sat SAT Exclude a satellite from all remote channels (channels 2+) only.
+
+Exclusions are case-insensitive and are applied during scheduling so excluded passes on
+one channel can still be placed on channels where they are not excluded.
 
 Usage (fetch mode):
     cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] ...
@@ -300,6 +309,7 @@ def schedule_n_channels(
     gap_seconds: int = 190,
     max_trim_seconds: int = 180,
     max_start_delay: int = 180,
+    channel_exclude_sats: Optional[List[set]] = None,
 ) -> List[List[Pass]]:
     """Assign passes to N channels while enforcing gaps, start delays, and trim limits.
 
@@ -314,6 +324,10 @@ def schedule_n_channels(
         gap_seconds: Minimum gap between consecutive passes on a channel.
         max_trim_seconds: Maximum total trim allowed on a previous pass duration.
         max_start_delay: Maximum delay allowed to push a pass start later.
+        channel_exclude_sats: Optional per-channel exclusion sets. If provided,
+            channel_exclude_sats[i] is a set of lowercase satellite names that
+            must not be assigned to channel i. A pass excluded from one channel
+            may still be placed on a channel where it is not excluded.
 
     Returns:
         A list of n_channels lists, each containing scheduled Pass objects with
@@ -330,6 +344,8 @@ def schedule_n_channels(
 
         candidates = []  # tuples: (i, adj_start, adj_dur, prev_new_dur_or_None)
         for i in range(n_channels):
+            if channel_exclude_sats and p.sat.lower() in channel_exclude_sats[i]:
+                continue
             prev = ch[i][-1] if ch[i] else None
             adj_dur = floor_to_10s_seconds(p.dur_s)
 
@@ -739,6 +755,30 @@ def main():
         metavar="HOST",
         help="Remote host for channel 2, 3, ... (repeat for each additional channel; e.g. user@host)",
     )
+    ap.add_argument(
+        "--exclude-sat",
+        dest="exclude_sats",
+        action="append",
+        default=[],
+        metavar="SAT",
+        help="Satellite name to exclude from ALL channels (repeat for multiple; case-insensitive)",
+    )
+    ap.add_argument(
+        "--local-exclude-sat",
+        dest="local_exclude_sats",
+        action="append",
+        default=[],
+        metavar="SAT",
+        help="Satellite name to exclude from the local channel only (repeat for multiple; case-insensitive)",
+    )
+    ap.add_argument(
+        "--remote-exclude-sat",
+        dest="remote_exclude_sats",
+        action="append",
+        default=[],
+        metavar="SAT",
+        help="Satellite name to exclude from all remote channels (repeat for multiple; case-insensitive)",
+    )
     args = ap.parse_args()
 
     if args.fetch:
@@ -794,6 +834,24 @@ def main():
         all_passes.extend(parse_schedule(path))
     uniq = dedupe_passes(all_passes)
 
+    # Build per-channel satellite exclusion sets
+    global_excl = {s.lower() for s in args.exclude_sats}
+    local_excl = {s.lower() for s in args.local_exclude_sats}
+    remote_excl = {s.lower() for s in args.remote_exclude_sats}
+
+    channel_exclude_sats = []
+    for i in range(n_channels):
+        excl = set(global_excl)
+        if i == 0:
+            excl |= local_excl
+        else:
+            excl |= remote_excl
+        channel_exclude_sats.append(excl)
+
+    for i, excl in enumerate(channel_exclude_sats, start=1):
+        if excl:
+            print(f"Channel {i}: excluding satellites: {', '.join(sorted(excl))}")
+
     # Schedule across N channels
     channels = schedule_n_channels(
         uniq,
@@ -801,6 +859,7 @@ def main():
         gap_seconds=args.gap,
         max_trim_seconds=args.max_trim,
         max_start_delay=args.max_start_delay,
+        channel_exclude_sats=channel_exclude_sats,
     )
 
     # Resolve output paths (use supplied --out values, fall back to defaults)

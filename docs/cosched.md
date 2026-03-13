@@ -48,6 +48,21 @@ In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` befor
 | `--max-trim <int>` | `180` | Maximum total duration reduction (seconds) allowed per pass |
 | `--max-start-delay <int>` | `180` | Maximum start delay (seconds) allowed when pushing a pass later |
 | `--remote-host <host>` | — | SSH host for channel 2, 3, … (repeat for each additional channel) |
+| `--exclude-sat <sat>` | — | Exclude a satellite from **all** channels (repeat for multiple) |
+| `--local-exclude-sat <sat>` | — | Exclude a satellite from the local channel (channel 1) only (repeat for multiple) |
+| `--remote-exclude-sat <sat>` | — | Exclude a satellite from all remote channels (channels 2+) only (repeat for multiple) |
+
+## Satellite exclusion
+
+Passes for specific satellites can be excluded from scheduling on a per-channel basis. Exclusions are case-insensitive and are applied during the scheduling phase, so a pass excluded from one channel can still be placed on a channel where it is not excluded.
+
+| Option | Scope |
+|--------|-------|
+| `--exclude-sat <sat>` | Excluded from all channels |
+| `--local-exclude-sat <sat>` | Excluded from channel 1 (local) only |
+| `--remote-exclude-sat <sat>` | Excluded from channels 2+ (remote) only |
+
+All three options may be repeated to exclude multiple satellites.
 
 ## Input file format
 
@@ -162,6 +177,23 @@ python3 cosched.py --fetch \
   --remote-host ops@remote-gs \
   --out /opt/schedules/local.sched \
   --out /opt/schedules/remote.sched
+```
+
+### Exclude satellites from specific channels
+
+```bash
+# Exclude NOAA-20 from all channels, and metop-3 only from the remote channel
+python3 cosched.py --fetch \
+  --remote-host user@antenna2.example.com \
+  --exclude-sat noaa-20 \
+  --local-exclude-sat metop-3
+```
+
+```bash
+# Exclude a satellite from remote channels only (e.g. antenna2 cannot receive it)
+python3 cosched.py --fetch \
+  --remote-host user@antenna2.example.com \
+  --remote-exclude-sat aqua
 ```
 
 ## Subprocess timeouts
