@@ -2,6 +2,8 @@
 
 Merges one or more TeraScan satellite pass schedule files, deduplicates overlapping passes, and distributes the resulting passes across one or more gap-constrained output channels. Each output channel is then pushed to TeraScan via `clearsched` + `mansched` (locally for channel 1, over SSH for additional channels).
 
+Remote scheduling is submitted in a single SSH batch per remote channel to reduce connection overhead and timeout risk on high-latency links.
+
 ## Dependencies
 
 | Command / Module | Purpose |
@@ -47,6 +49,10 @@ In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` befor
 | `--gap <int>` | `190` | Minimum gap in seconds between consecutive passes on a channel |
 | `--max-trim <int>` | `180` | Maximum total duration reduction (seconds) allowed per pass |
 | `--max-start-delay <int>` | `180` | Maximum start delay (seconds) allowed when pushing a pass later |
+| `--timeout-secs <int>` | `120` | Timeout in seconds for each subprocess call (`listsched`, `clearsched`, `mansched`, `ssh`) |
+| `--ssh-connect-timeout <int>` | `30` | SSH connection timeout in seconds |
+| `--ssh-keepalive-interval <int>` | `30` | SSH `ServerAliveInterval` in seconds |
+| `--ssh-keepalive-count-max <int>` | `3` | SSH `ServerAliveCountMax` |
 | `--remote-host <host>` | — | SSH host for channel 2, 3, … (repeat for each additional channel) |
 | `--exclude-sat <sat>` | — | Exclude a satellite from **all** channels (repeat for multiple) |
 | `--local-exclude-sat <sat>` | — | Exclude a satellite from the local channel (channel 1) only (repeat for multiple) |
@@ -112,18 +118,20 @@ Channels without a corresponding `--remote-host` are written to the output file 
 
 ## Telemetry-to-chain mapping
 
-The following default mapping is used when constructing `mansched` commands. Adjust in `telemetry_to_chain()` for site-specific configurations.
+Telemetry chain mapping is loaded from `/opt/terascan/pass/config/system.config` when available.
+
+- Numeric section names (for example `[1]`, `[2]`, ...) are treated as chain IDs.
+- `telemetry.name` values in those sections are mapped (case-insensitive) to chain IDs.
+- If no usable mapping is found, `cosched.py` falls back to the built-in defaults below.
 
 | Telemetry | Chain |
 |-----------|-------|
-| `teradb` | 1 |
-| `aquadb` | 2 |
-| `nppdb` | 3 |
-| `jpssdb` | 4 |
-| `mpt` | 5 |
-| `hrtp` | 6 |
-| `ahrpt` | 7 |
-| `rtd` | 8 |
+| `aquadb` | 1 |
+| `nppdb` | 2 |
+| `jpssdb` | 3 |
+| `jpss2db` | 4 |
+| `ahrpt` | 5 |
+| `rtd` | 6 |
 
 Unrecognized telemetry strings default to chain 1.
 
@@ -158,6 +166,17 @@ python3 cosched.py --fetch \
 
 Fetches schedules from the local host and `antenna2`, merges and deduplicates them, builds two channels, loads channel 1 locally, and loads channel 2 on `antenna2` via SSH.
 
+### Increase SSH/subprocess timeouts for slow links
+
+```bash
+python3 cosched.py --fetch \
+  --remote-host user@antenna2.example.com \
+  --timeout-secs 300 \
+  --ssh-connect-timeout 60 \
+  --ssh-keepalive-interval 30 \
+  --ssh-keepalive-count-max 5
+```
+
 ### File mode with custom gap
 
 ```bash
@@ -182,7 +201,7 @@ python3 cosched.py --fetch \
 ### Exclude satellites from specific channels
 
 ```bash
-# Exclude NOAA-20 from all channels, and metop-3 only from the remote channel
+# Exclude NOAA-20 from all channels, and metop-3 only from the local channel
 python3 cosched.py --fetch \
   --remote-host user@antenna2.example.com \
   --exclude-sat noaa-20 \
@@ -198,4 +217,12 @@ python3 cosched.py --fetch \
 
 ## Subprocess timeouts
 
-All calls to `listsched`, `clearsched`, `mansched`, and remote SSH commands time out after 120 seconds (`TIMEOUT_SECS`). Timeouts are logged to stdout but do not abort the entire run.
+All calls to `listsched`, `clearsched`, `mansched`, and remote SSH commands use `--timeout-secs` (default: 120).
+
+SSH behavior is additionally controlled by:
+
+- `--ssh-connect-timeout` (default: 30)
+- `--ssh-keepalive-interval` (default: 30)
+- `--ssh-keepalive-count-max` (default: 3)
+
+Timeouts and subprocess failures are logged to stdout/stderr. The scheduler continues where possible and reports per-host failures.

@@ -1,4 +1,4 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Co-scheduler: Read one or more satellite schedule files, deduplicate passes, and build
 one or more new schedules maximizing the number of passes while ensuring at least
@@ -29,6 +29,8 @@ Assumptions:
 Usage (file mode):
     cosched.py <input1> [<input2> ...] [--out <path>] [--out <path>] ... \
         [--gap 190] [--max-trim 180] [--max-start-delay 180] \
+        [--timeout-secs 120] [--ssh-connect-timeout 30] \
+        [--ssh-keepalive-interval 30] [--ssh-keepalive-count-max 3] \
         [--remote-host user@host] [--remote-host user@host2] ... \
         [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ...
 
@@ -53,9 +55,13 @@ In both modes:
 - Each additional channel maps to the corresponding --remote-host (in order) and is pushed
   over SSH. If more channels than --remote-host entries, the extra channels are written
   locally but not pushed remotely.
+- Remote mansched submissions are batched per host into a single SSH session to reduce
+    connection overhead and timeout risk.
 
-All subprocess calls (clearsched, mansched, listsched, remote SSH) time out after
-TIMEOUT_SECS seconds (default: 120). Remote commands source
+All subprocess calls (clearsched, mansched, listsched, remote SSH) use
+--timeout-secs (default: 120). SSH connection and keepalive behavior are configurable
+with --ssh-connect-timeout, --ssh-keepalive-interval, and
+--ssh-keepalive-count-max. Remote commands source
 /opt/terascan/etc/tscan.bash_profile before executing.
 
 Compatible with Python 3.6+ (RHEL 7).
@@ -83,6 +89,9 @@ from typing import List, Dict, Optional, Tuple
 
 HEADER = "#  state  pri  satel    telem       date    day    time    durat  post_process"
 TIMEOUT_SECS = 120  # per subprocess call
+SSH_CONNECT_TIMEOUT = 30
+SSH_SERVER_ALIVE_INTERVAL = 30
+SSH_SERVER_ALIVE_COUNT_MAX = 3
 LISTSCHED = "/opt/terascan/bin/listsched"   # listsched binary path
 SCHED_DIR = "/tmp"                           # directory for fetched .sched files
 SYSTEM_CONFIG = "/opt/terascan/pass/config/system.config"  # TeraScan system config
@@ -476,8 +485,24 @@ def clear_remote_tschedule(host: Optional[str] = None) -> None:
         return
     cmd = "/opt/terascan/bin/clearsched"
     try:
-        remote_cmd = shlex.quote(cmd)
-        ssh_args = ["ssh", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, "source /opt/terascan/etc/tscan.bash_profile; " + remote_cmd]
+        remote_cmd = "bash -lc " + shlex.quote(
+            "source /opt/terascan/etc/tscan.bash_profile && " + shlex.quote(cmd)
+        )
+        ssh_args = [
+            "ssh",
+            "-n",
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+            "-o",
+            "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
+            "-o",
+            "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
+            host,
+            remote_cmd,
+        ]
         print("Running:", " ".join(ssh_args))
         result = subprocess.run(
             ssh_args,
@@ -576,28 +601,51 @@ def push_schedule_to_remote_mansched(passes: List[Pass], host: str, overrides: O
         return
     cmd = "/opt/terascan/bin/mansched"
     try:
-        # Sort by start time to submit in time order
+        # Sort by start time to submit in time order, then run in a single SSH session
+        # to avoid per-pass connection overhead on high-latency links.
         ordered = sorted(passes, key=lambda x: x.out_start or x.start)
+        remote_lines = []
         for p in ordered:
             dur_s = p.out_dur_s if p.out_dur_s is not None else p.dur_s
             if dur_s <= 0:
                 continue  # skip zero-length passes
             tokens = [cmd] + build_mansched_args(p, overrides)
-            remote_cmd = " ".join(shlex.quote(t) for t in tokens)
-            ssh_args = ["ssh", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, "source /opt/terascan/etc/tscan.bash_profile; " + remote_cmd]
-            print("Running:", " ".join(ssh_args))
-            result = subprocess.run(
-                ssh_args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=TIMEOUT_SECS,
-            )
-            if result.stdout:
-                print(result.stdout.strip())
-            if result.returncode != 0:
-                err = result.stderr.strip() if result.stderr else ""
-                print(f"remote mansched exited with status {result.returncode}" + (f": {err}" if err else ""))
+            remote_lines.append(" ".join(shlex.quote(t) for t in tokens))
+
+        if not remote_lines:
+            print("No remote passes to schedule; skipping remote mansched.")
+            return
+
+        remote_script = "source /opt/terascan/etc/tscan.bash_profile && set -e\n" + "\n".join(remote_lines)
+        remote_cmd = "bash -lc " + shlex.quote(remote_script)
+        ssh_args = [
+            "ssh",
+            "-n",
+            "-q",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+            "-o",
+            "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
+            "-o",
+            "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
+            host,
+            remote_cmd,
+        ]
+        print("Running remote mansched batch for {} pass(es) on {}".format(len(remote_lines), host))
+        result = subprocess.run(
+            ssh_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=TIMEOUT_SECS,
+        )
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            err = result.stderr.strip() if result.stderr else ""
+            print(f"remote mansched exited with status {result.returncode}" + (f": {err}" if err else ""))
     except subprocess.TimeoutExpired:
         print(f"remote mansched timed out after {TIMEOUT_SECS}s on {host}")
     except Exception as e:
@@ -668,10 +716,26 @@ def fetch_remote_schedule(host: str) -> str:
         RuntimeError: If ssh is not on PATH, the call times out, or the
             remote command exits with a non-zero status.
     """
-    remote_cmd = "source /opt/terascan/etc/tscan.bash_profile && {}".format(LISTSCHED)
+    remote_cmd = "bash -lc " + shlex.quote(
+        "source /opt/terascan/etc/tscan.bash_profile && {}".format(shlex.quote(LISTSCHED))
+    )
     try:
         proc = subprocess.run(
-            ["ssh", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30", host, remote_cmd],
+            [
+                "ssh",
+                "-n",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+                "-o",
+                "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
+                "-o",
+                "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
+                host,
+                remote_cmd,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -713,6 +777,7 @@ def write_raw_schedule(label: str, content: str) -> str:
 
 
 def main():
+    global TIMEOUT_SECS, SSH_CONNECT_TIMEOUT, SSH_SERVER_ALIVE_INTERVAL, SSH_SERVER_ALIVE_COUNT_MAX
     ap = argparse.ArgumentParser(
         description=(
             "Co-schedule satellite pass lists into one or more gap-constrained schedules. "
@@ -747,6 +812,10 @@ def main():
     ap.add_argument("--gap", type=int, default=190, help="Minimum gap in seconds between passes on a channel (default: 190)")
     ap.add_argument("--max-trim", type=int, default=180, help="Maximum total duration reduction allowed per pass in seconds (default: 180)")
     ap.add_argument("--max-start-delay", type=int, default=180, help="Maximum start delay allowed for a pass in seconds (default: 180)")
+    ap.add_argument("--timeout-secs", type=int, default=TIMEOUT_SECS, help="Subprocess timeout in seconds for clearsched/mansched/listsched/ssh calls (default: 120)")
+    ap.add_argument("--ssh-connect-timeout", type=int, default=SSH_CONNECT_TIMEOUT, help="SSH connection timeout in seconds (default: 30)")
+    ap.add_argument("--ssh-keepalive-interval", type=int, default=SSH_SERVER_ALIVE_INTERVAL, help="SSH ServerAliveInterval in seconds (default: 30)")
+    ap.add_argument("--ssh-keepalive-count-max", type=int, default=SSH_SERVER_ALIVE_COUNT_MAX, help="SSH ServerAliveCountMax (default: 3)")
     ap.add_argument(
         "--remote-host",
         dest="remote_hosts",
@@ -780,6 +849,20 @@ def main():
         help="Satellite name to exclude from all remote channels (repeat for multiple; case-insensitive)",
     )
     args = ap.parse_args()
+
+    if args.timeout_secs <= 0:
+        ap.error("--timeout-secs must be > 0")
+    if args.ssh_connect_timeout <= 0:
+        ap.error("--ssh-connect-timeout must be > 0")
+    if args.ssh_keepalive_interval <= 0:
+        ap.error("--ssh-keepalive-interval must be > 0")
+    if args.ssh_keepalive_count_max <= 0:
+        ap.error("--ssh-keepalive-count-max must be > 0")
+
+    TIMEOUT_SECS = args.timeout_secs
+    SSH_CONNECT_TIMEOUT = args.ssh_connect_timeout
+    SSH_SERVER_ALIVE_INTERVAL = args.ssh_keepalive_interval
+    SSH_SERVER_ALIVE_COUNT_MAX = args.ssh_keepalive_count_max
 
     if args.fetch:
         # Fetch mode: run listsched locally and on each remote host, write raw
