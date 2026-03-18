@@ -161,6 +161,13 @@ Each channel is written as a text file using the same column layout as the input
 
 Pass states are normalized to `sched`; start times and durations reflect any scheduling adjustments.
 
+### Unscheduled passes
+
+After each run, passes that were not placed on any channel are written to `/tmp/cosched_not_scheduled` in the same format. A pass ends up in this file when:
+
+- Its original start time is already in the past, **or**
+- Every channel rejects it because the required start delay would exceed `--max-start-delay` and trimming the previous pass on every channel would exceed `--max-trim`.
+
 ## Examples
 
 ### Single-host fetch and schedule

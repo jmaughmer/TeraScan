@@ -62,6 +62,9 @@ In both modes:
 - Each additional channel maps to the corresponding --remote-host (in order) and is pushed
   over SSH. If more channels than --remote-host entries, the extra channels are written
   locally but not pushed remotely.
+- Passes that could not be placed on any channel (past passes, or passes blocked by gap/trim
+  constraints on all channels) are written to /tmp/cosched_not_scheduled in the same
+  schedule file format.
 - Remote mansched submissions are batched per host into a single SSH session to reduce
     connection overhead and timeout risk.
 
@@ -326,7 +329,7 @@ def schedule_n_channels(
     max_trim_seconds: int = 180,
     max_start_delay: int = 180,
     channel_exclude_sats: Optional[List[set]] = None,
-) -> List[List[Pass]]:
+) -> Tuple[List[List[Pass]], List[Pass]]:
     """Assign passes to N channels while enforcing gaps, start delays, and trim limits.
 
     Uses a greedy algorithm: for each pass (in start-time order), find all channels
@@ -346,16 +349,20 @@ def schedule_n_channels(
             may still be placed on a channel where it is not excluded.
 
     Returns:
-        A list of n_channels lists, each containing scheduled Pass objects with
-        adjusted out_start and out_dur_s fields.
+        A tuple of (channels, unscheduled) where channels is a list of n_channels
+        lists each containing scheduled Pass objects with adjusted out_start and
+        out_dur_s fields, and unscheduled is a list of Pass objects that could not
+        be placed on any channel (including passes whose start time is in the past).
     """
     ch = [[] for _ in range(n_channels)]  # type: List[List[Pass]]
+    unscheduled = []  # type: List[Pass]
     max_trim_10 = floor_to_10s_seconds(max_trim_seconds)
     now = datetime.now()
 
     for p in passes:
         # Skip passes whose original start time is already in the past
         if p.start < now:
+            unscheduled.append(p)
             continue
 
         candidates = []  # tuples: (i, adj_start, adj_dur, prev_new_dur_or_None)
@@ -399,6 +406,7 @@ def schedule_n_channels(
                     candidates.append((i, adj_start, adj_dur, new_prev_dur))
 
         if not candidates:
+            unscheduled.append(p)
             continue
 
         # Choose earliest start, then longer duration, then lower channel index
@@ -427,7 +435,7 @@ def schedule_n_channels(
         )
         ch[i].append(q)
 
-    return ch
+    return ch, unscheduled
 
 
 def write_schedule(path: str, passes: List[Pass]) -> None:
@@ -970,7 +978,7 @@ def main():
             print("Satellite priority override: {} -> {}".format(sat, pri))
 
     # Schedule across N channels
-    channels = schedule_n_channels(
+    channels, unscheduled = schedule_n_channels(
         uniq,
         n_channels=n_channels,
         gap_seconds=args.gap,
@@ -995,6 +1003,11 @@ def main():
     for i, (ch, path) in enumerate(zip(channels, out_paths), start=1):
         write_schedule(path, ch)
         print(f"Wrote {len(ch)} passes to channel {i}: {path}")
+
+    # Write unscheduled passes
+    not_sched_path = "/tmp/cosched_not_scheduled"
+    write_schedule(not_sched_path, unscheduled)
+    print(f"Wrote {len(unscheduled)} unscheduled passes to {not_sched_path}")
 
     # Push schedules.
     # Channel 1 (index 0) is always local.
