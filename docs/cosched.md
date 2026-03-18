@@ -30,7 +30,7 @@ Provide one or more pre-existing schedule files as positional arguments:
 cosched.py <input1> [<input2> ...] [OPTIONS]
 ```
 
-### Fetch mode
+> **Tip:** Use `--sat-priority SAT=PRIORITY` to override the scheduled priority for specific satellites (see [Satellite priority overrides](#satellite-priority-overrides)).
 
 Automatically retrieve schedules by running `listsched` locally and on each `--remote-host`, then schedule the combined result:
 
@@ -57,6 +57,7 @@ In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` befor
 | `--exclude-sat <sat>` | — | Exclude a satellite from **all** channels (repeat for multiple) |
 | `--local-exclude-sat <sat>` | — | Exclude a satellite from the local channel (channel 1) only (repeat for multiple) |
 | `--remote-exclude-sat <sat>` | — | Exclude a satellite from all remote channels (channels 2+) only (repeat for multiple) |
+| `--sat-priority <sat>=<pri>` | — | Override the priority for a satellite across **all** channels (repeat for multiple; case-insensitive) |
 
 ## Satellite exclusion
 
@@ -69,6 +70,19 @@ Passes for specific satellites can be excluded from scheduling on a per-channel 
 | `--remote-exclude-sat <sat>` | Excluded from channels 2+ (remote) only |
 
 All three options may be repeated to exclude multiple satellites.
+
+## Satellite priority overrides
+
+Use `--sat-priority SAT=PRIORITY` to override the priority recorded in the input schedule for a specific satellite. Overrides are applied to all channels after scheduling and before writing output files and submitting to `mansched`. Multiple satellites may be overridden by repeating the option.
+
+```bash
+# Lower metop-3 to priority 2 and raise aqua to priority 1
+python3 cosched.py --fetch \
+  --sat-priority metop-3=2 \
+  --sat-priority aqua=1
+```
+
+Priority values follow TeraScan conventions (lower number = higher priority). Satellite names are matched case-insensitively.
 
 ## Input file format
 
@@ -213,6 +227,15 @@ python3 cosched.py --fetch \
 python3 cosched.py --fetch \
   --remote-host user@antenna2.example.com \
   --remote-exclude-sat aqua
+```
+
+### Override satellite priorities
+
+```bash
+python3 cosched.py --fetch \
+  --sat-priority metop-3=2 \
+  --sat-priority noaa-20=1 \
+  --sat-priority aqua=3
 ```
 
 ## Subprocess timeouts

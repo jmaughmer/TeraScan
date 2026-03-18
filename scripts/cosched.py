@@ -32,7 +32,8 @@ Usage (file mode):
         [--timeout-secs 120] [--ssh-connect-timeout 30] \
         [--ssh-keepalive-interval 30] [--ssh-keepalive-count-max 3] \
         [--remote-host user@host] [--remote-host user@host2] ... \
-        [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ...
+        [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ... \
+        [--sat-priority SAT=PRIORITY] ...
 
 Satellite exclusion:
 - --exclude-sat SAT        Exclude a satellite from ALL channels (repeat for multiple).
@@ -41,6 +42,12 @@ Satellite exclusion:
 
 Exclusions are case-insensitive and are applied during scheduling so excluded passes on
 one channel can still be placed on channels where they are not excluded.
+
+Satellite priority overrides:
+- --sat-priority SAT=PRIORITY  Override the scheduled priority for a satellite across all
+    channels (repeat for multiple; case-insensitive). Applied after scheduling, before
+    writing output files and submitting to mansched. Takes precedence over priorities in
+    the input schedule.
 
 Usage (fetch mode):
     cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] ...
@@ -848,7 +855,30 @@ def main():
         metavar="SAT",
         help="Satellite name to exclude from all remote channels (repeat for multiple; case-insensitive)",
     )
+    ap.add_argument(
+        "--sat-priority",
+        dest="sat_priorities",
+        action="append",
+        default=[],
+        metavar="SAT=PRIORITY",
+        help=(
+            "Override the priority for a specific satellite (e.g. metop-3=2). "
+            "Repeat for multiple satellites. Case-insensitive. "
+            "Applies to all channels and takes precedence over priorities in the input schedule."
+        ),
+    )
     args = ap.parse_args()
+
+    # Parse --sat-priority SAT=PRIORITY entries
+    sat_priority_map = {}  # type: Dict[str, int]
+    for entry in args.sat_priorities:
+        if "=" not in entry:
+            ap.error("--sat-priority must be in SAT=PRIORITY format, got: {}".format(entry))
+        sat_raw, _, pri_str = entry.partition("=")
+        try:
+            sat_priority_map[sat_raw.strip().lower()] = int(pri_str.strip())
+        except ValueError:
+            ap.error("--sat-priority priority must be an integer, got: {!r}".format(pri_str.strip()))
 
     if args.timeout_secs <= 0:
         ap.error("--timeout-secs must be > 0")
@@ -935,6 +965,10 @@ def main():
         if excl:
             print(f"Channel {i}: excluding satellites: {', '.join(sorted(excl))}")
 
+    if sat_priority_map:
+        for sat, pri in sorted(sat_priority_map.items()):
+            print("Satellite priority override: {} -> {}".format(sat, pri))
+
     # Schedule across N channels
     channels = schedule_n_channels(
         uniq,
@@ -944,6 +978,14 @@ def main():
         max_start_delay=args.max_start_delay,
         channel_exclude_sats=channel_exclude_sats,
     )
+
+    # Apply per-satellite priority overrides to all scheduled passes
+    if sat_priority_map:
+        for ch in channels:
+            for p in ch:
+                override = sat_priority_map.get(p.sat.lower())
+                if override is not None:
+                    p.pri = override
 
     # Resolve output paths (use supplied --out values, fall back to defaults)
     defaults = default_output_paths(input_paths[0], n_channels)
