@@ -14,8 +14,12 @@ Scheduling rules:
 - Do not reduce any pass's duration by more than --max-trim seconds in total
     relative to its original duration (default: 180 seconds).
 - Passes whose original start time is in the past are skipped.
-- Assignment is greedy: each pass is placed on the channel that allows the earliest
-    adjusted start; ties resolved by longest duration, then lowest channel index.
+- Assignment is greedy: passes are processed in priority order (lower number = higher
+    priority), then by start time within each priority level. Each pass is placed on the
+    channel that allows the earliest adjusted start via greedy append; ties resolved by
+    longest duration, then lowest channel index. If append fails on all channels, an
+    insertion fallback tries every position within each channel, adjusting surrounding
+    passes only when necessary and preferring positions that require no such adjustments.
 
 Input format (space-separated, header lines start with '#'):
 #  state  pri  satel    telem       date    day    time    durat  post_process
@@ -322,6 +326,104 @@ def format_output_line(idx: int, state: str, pri: int, sat: str, telem: str, dt:
     )
 
 
+def _find_insertion(
+    ch_passes,        # type: List[Pass]
+    p,                # type: Pass
+    gap_seconds,      # type: int
+    max_trim_10,      # type: int
+    max_start_delay,  # type: int
+):
+    # type: (...) -> Optional[Tuple[int, datetime, int, List[Tuple[int, Optional[datetime], Optional[int]]]]]
+    """Find a valid mid-channel insertion position for pass p.
+
+    Tries each insertion index from 0 to len(ch_passes)-1 (appending after the last
+    pass is already handled by the primary loop and is therefore skipped here).  For
+    each candidate position the function:
+
+    - Optionally trims the immediately preceding pass (within its remaining trim budget)
+      to create the required leading gap.
+    - Cascade-delays any following passes (within their remaining start-delay budgets)
+      until a sufficient trailing gap is restored.
+
+    Args:
+        ch_passes: Already-scheduled passes on this channel.
+        p: The candidate pass to insert.
+        gap_seconds: Minimum gap required between consecutive passes.
+        max_trim_10: Maximum duration trim allowed per pass (floored to 10 s).
+        max_start_delay: Maximum start delay allowed per pass.
+
+    Returns:
+        ``(insert_idx, adj_start, adj_dur, side_effects)`` when a valid position is
+        found, or ``None`` otherwise.  *side_effects* is a list of
+        ``(ch_idx, new_out_start_or_None, new_out_dur_s_or_None)`` describing in-place
+        changes to already-scheduled passes; a ``None`` field value means no change.
+        Positions that require no side effects (no disruption to already-scheduled passes)
+        are preferred over those that do; within each group the earliest adjusted start
+        wins, then longest duration.
+    """
+    adj_dur = floor_to_10s_seconds(p.dur_s)
+    best = None  # type: Optional[Tuple[int, datetime, int, List]]
+
+    for j in range(len(ch_passes)):  # j=len (append) already tried by the main loop
+        p_prev = ch_passes[j - 1] if j > 0 else None
+        following = ch_passes[j:]
+
+        side_effects = []  # type: List[Tuple[int, Optional[datetime], Optional[int]]]
+
+        # --- Step 1: adjusted start for new pass, optionally trimming p_prev ---
+        if p_prev is None:
+            adj_start = ceil_to_next_10s(p.start)
+        else:
+            prev_end = p_prev.out_start + timedelta(seconds=p_prev.out_dur_s)
+            min_start = prev_end + timedelta(seconds=gap_seconds)
+            if p.start >= min_start:
+                adj_start = ceil_to_next_10s(p.start)
+            else:
+                needed = int((min_start - p.start).total_seconds())
+                if needed <= max_start_delay:
+                    adj_start = ceil_to_next_10s(p.start + timedelta(seconds=needed))
+                else:
+                    capped_start = p.start + timedelta(seconds=max_start_delay)
+                    adj_start = ceil_to_next_10s(capped_start)
+                    target_prev_end = adj_start - timedelta(seconds=gap_seconds)
+                    target_prev_dur_raw = int((target_prev_end - p_prev.out_start).total_seconds())
+                    target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
+                    min_prev_dur_allowed = max(0, floor_to_10s_seconds(p_prev.dur_s) - max_trim_10)
+                    if target_prev_dur < min_prev_dur_allowed:
+                        continue  # can't trim p_prev enough
+                    side_effects.append((j - 1, None, min(p_prev.out_dur_s, target_prev_dur)))
+
+        if int((adj_start - p.start).total_seconds()) > max_start_delay:
+            continue
+
+        # --- Step 2: cascade-delay following passes to restore required gaps ---
+        new_end = adj_start + timedelta(seconds=adj_dur)
+        feasible = True
+        prev_end_dt = new_end
+
+        for k, fp in enumerate(following):
+            min_fp_start = ceil_to_next_10s(prev_end_dt + timedelta(seconds=gap_seconds))
+            if fp.out_start >= min_fp_start:
+                break  # sufficient gap already; subsequent passes also unaffected
+            already_delayed = int((fp.out_start - fp.start).total_seconds())
+            extra_needed = int((min_fp_start - fp.out_start).total_seconds())
+            if already_delayed + extra_needed > max_start_delay:
+                feasible = False
+                break
+            side_effects.append((j + k, min_fp_start, None))
+            prev_end_dt = min_fp_start + timedelta(seconds=fp.out_dur_s)
+
+        if feasible:
+            # Prefer slots with no side effects (original times preserved),
+            # then earliest adjusted start, then longest duration.
+            key = (bool(side_effects), adj_start, -adj_dur)
+            best_key = (bool(best[3]), best[1], -best[2]) if best is not None else None
+            if best is None or key < best_key:
+                best = (j, adj_start, adj_dur, side_effects)
+
+    return best
+
+
 def schedule_n_channels(
     passes: List[Pass],
     n_channels: int,
@@ -332,13 +434,18 @@ def schedule_n_channels(
 ) -> Tuple[List[List[Pass]], List[Pass]]:
     """Assign passes to N channels while enforcing gaps, start delays, and trim limits.
 
-    Uses a greedy algorithm: for each pass (in start-time order), find all channels
-    that can accept it and pick the one that yields the earliest adjusted start;
-    ties broken by longest adjusted duration, then lowest channel index. Passes whose
-    original start time is already in the past are silently skipped.
+    Passes are sorted by priority (lower number = higher priority) then start time so
+    that higher-priority passes claim channel slots first.  For each pass, every channel
+    is evaluated for appending and the one yielding the earliest adjusted start is chosen
+    (ties broken by longest adjusted duration, then lowest channel index).  When all
+    channels reject the append attempt, a secondary insertion pass tries to slot the pass
+    at any earlier position within each channel by trimming the preceding scheduled pass
+    and/or forward-shifting following scheduled passes, within their respective trim and
+    start-delay budgets.  Passes whose original start time is already in the past are
+    silently skipped.
 
     Args:
-        passes: List of Pass objects to schedule (should be pre-sorted by start time).
+        passes: List of Pass objects to schedule.
         n_channels: Number of output channels to fill.
         gap_seconds: Minimum gap between consecutive passes on a channel.
         max_trim_seconds: Maximum total trim allowed on a previous pass duration.
@@ -359,7 +466,9 @@ def schedule_n_channels(
     max_trim_10 = floor_to_10s_seconds(max_trim_seconds)
     now = datetime.now()
 
-    for p in passes:
+    # Process higher-priority passes first (lower pri number = higher priority);
+    # within the same priority level, preserve start-time order.
+    for p in sorted(passes, key=lambda p: (p.pri, p.start)):
         # Skip passes whose original start time is already in the past
         if p.start < now:
             unscheduled.append(p)
@@ -406,7 +515,47 @@ def schedule_n_channels(
                     candidates.append((i, adj_start, adj_dur, new_prev_dur))
 
         if not candidates:
-            unscheduled.append(p)
+            # Greedy append failed on all channels; try inserting at an earlier
+            # position within each channel, adjusting surrounding passes as needed.
+            best_insert = None
+            for i in range(n_channels):
+                if channel_exclude_sats and p.sat.lower() in channel_exclude_sats[i]:
+                    continue
+                result = _find_insertion(ch[i], p, gap_seconds, max_trim_10, max_start_delay)
+                if result is None:
+                    continue
+                ins_idx, adj_start, adj_dur, side_effects = result
+                key = (bool(side_effects), adj_start, -adj_dur, i)
+                best_key = (bool(best_insert[4]), best_insert[2], -best_insert[3], best_insert[0]) if best_insert is not None else None
+                if best_insert is None or key < best_key:
+                    best_insert = (i, ins_idx, adj_start, adj_dur, side_effects)
+
+            if best_insert is None:
+                unscheduled.append(p)
+                continue
+
+            i, ins_idx, adj_start, adj_dur, side_effects = best_insert
+            for ch_idx, new_start, new_dur in side_effects:
+                if new_start is not None:
+                    ch[i][ch_idx].out_start = new_start
+                if new_dur is not None:
+                    ch[i][ch_idx].out_dur_s = new_dur
+            q = Pass(
+                idx=p.idx,
+                state="sched",
+                pri=p.pri,
+                sat=p.sat,
+                telem=p.telem,
+                date_str=p.date_str,
+                doy=p.doy,
+                time_str=p.time_str,
+                dur_str=p.dur_str,
+                start=p.start,
+                dur_s=p.dur_s,
+                out_start=adj_start,
+                out_dur_s=adj_dur,
+            )
+            ch[i].insert(ins_idx, q)
             continue
 
         # Choose earliest start, then longer duration, then lower channel index

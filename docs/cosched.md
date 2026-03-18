@@ -109,15 +109,18 @@ Duplicate passes (same date, time, satellite, and telemetry) are deduplicated by
 
 ## Scheduling algorithm
 
-Passes are assigned to channels using a **greedy, earliest-start** strategy:
+Passes are assigned to channels using a **priority-first, earliest-start** greedy strategy:
 
 1. Passes whose original start time is in the past are skipped.
-2. For each pass (processed in start-time order), every channel is evaluated.
-3. For a channel whose previous pass ends too close to the new pass:
-   - If the required delay is ≤ `--max-start-delay`, the pass start is pushed forward.
-   - Otherwise, the previous pass duration is trimmed (in 10-second steps) to create the gap. If the required trim would exceed `--max-trim`, the pass is skipped on that channel.
+2. Passes are sorted by priority (lower value = higher priority), then by start time within each priority level, so higher-priority passes claim channel slots first.
+3. For each pass, every eligible channel is evaluated for appending after its last scheduled pass:
+   - If the required gap is already satisfied, the pass start is used as-is (ceiled to 10 s).
+   - If the gap is short by ≤ `--max-start-delay`, the pass start is pushed forward.
+   - Otherwise, the previous pass's duration is trimmed (in 10-second steps) to create the gap. If trimming would exceed `--max-trim`, that channel is skipped.
 4. The channel that yields the **earliest adjusted start** is chosen; ties are broken by longest adjusted duration, then lowest channel index.
-5. Start times are rounded up to the nearest 10-second boundary; durations are rounded down to the nearest 10-second boundary.
+5. If no channel can accept the pass via append, an **insertion fallback** is attempted: every position within every channel is tested, optionally trimming the preceding pass and/or cascade-delaying following passes within their remaining trim and start-delay budgets. Insertion positions that require **no changes to already-scheduled passes** are preferred over those that modify surrounding passes; within each group the earliest adjusted start wins, then longest duration.
+6. If no insertion position is feasible on any channel, the pass is written to `/tmp/cosched_not_scheduled`.
+7. Start times are rounded up to the nearest 10-second boundary; durations are rounded down to the nearest 10-second boundary.
 
 ## Channel-to-host mapping
 
@@ -166,7 +169,7 @@ Pass states are normalized to `sched`; start times and durations reflect any sch
 After each run, passes that were not placed on any channel are written to `/tmp/cosched_not_scheduled` in the same format. A pass ends up in this file when:
 
 - Its original start time is already in the past, **or**
-- Every channel rejects it because the required start delay would exceed `--max-start-delay` and trimming the previous pass on every channel would exceed `--max-trim`.
+- Every channel rejects both the append attempt and all insertion positions because the required start delay would exceed `--max-start-delay` and/or trimming surrounding passes on every channel would exceed `--max-trim`.
 
 ## Examples
 
