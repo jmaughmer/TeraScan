@@ -13,6 +13,13 @@ Scheduling rules:
     exceeding the start-delay cap, the pass is skipped.
 - Do not reduce any pass's duration by more than --max-trim seconds in total
     relative to its original duration (default: 180 seconds).
+- When inserting a pass between two existing passes, the required trailing gap is created
+    by splitting the adjustment between trimming the new pass's stop time and delaying the
+    first following pass's start, so neither pass bears the full cost. The first following
+    pass absorbs as much as its remaining start-delay budget allows; the new pass is
+    trimmed for the remainder. If the cascade from delaying the first following pass
+    exceeds any later pass's start-delay budget, the algorithm falls back to cascade-
+    delaying all following passes without trimming the new pass.
 - Passes whose original start time is in the past are skipped.
 - Assignment is greedy: passes are processed in priority order (lower number = higher
     priority), then by start time within each priority level. Each pass is placed on the
@@ -342,8 +349,11 @@ def _find_insertion(
 
     - Optionally trims the immediately preceding pass (within its remaining trim budget)
       to create the required leading gap.
-    - Cascade-delays any following passes (within their remaining start-delay budgets)
-      until a sufficient trailing gap is restored.
+    - Splits the trailing-gap adjustment between trimming the new pass's stop time and
+      delaying the first following pass's start time, so neither pass bears the full
+      cost.  The new pass's end is trimmed by the portion of the shortfall that cannot
+      be absorbed by the first following pass's remaining start-delay budget.  Falls back
+      to cascade-delaying following passes only when the combined budgets are exhausted.
 
     Args:
         ch_passes: Already-scheduled passes on this channel.
@@ -396,30 +406,76 @@ def _find_insertion(
         if int((adj_start - p.start).total_seconds()) > max_start_delay:
             continue
 
-        # --- Step 2: cascade-delay following passes to restore required gaps ---
-        new_end = adj_start + timedelta(seconds=adj_dur)
+        # --- Step 2: create required trailing gap ---
+        # Split the gap deficit between trimming the new pass's stop time and delaying
+        # the first following pass's start, so neither pass bears the full cost.  The
+        # first following pass absorbs as much of the shortfall as its remaining
+        # start-delay budget allows; the new pass is trimmed for what remains.  If the
+        # cascade from delaying the first following pass exceeds any later pass's budget,
+        # fall back to cascade-delaying all following passes without trimming the new pass.
+        use_dur = adj_dur
+        new_end = adj_start + timedelta(seconds=use_dur)
         feasible = True
         prev_end_dt = new_end
 
-        for k, fp in enumerate(following):
-            min_fp_start = ceil_to_next_10s(prev_end_dt + timedelta(seconds=gap_seconds))
-            if fp.out_start >= min_fp_start:
-                break  # sufficient gap already; subsequent passes also unaffected
-            already_delayed = int((fp.out_start - fp.start).total_seconds())
-            extra_needed = int((min_fp_start - fp.out_start).total_seconds())
-            if already_delayed + extra_needed > max_start_delay:
-                feasible = False
-                break
-            side_effects.append((j + k, min_fp_start, None))
-            prev_end_dt = min_fp_start + timedelta(seconds=fp.out_dur_s)
+        if following:
+            fp0 = following[0]
+            min_fp0_start = ceil_to_next_10s(new_end + timedelta(seconds=gap_seconds))
+            if fp0.out_start < min_fp0_start:
+                shortfall = int((min_fp0_start - fp0.out_start).total_seconds())
+                fp0_already_delayed = int((fp0.out_start - fp0.start).total_seconds())
+                fp0_avail_delay = max(0, max_start_delay - fp0_already_delayed)
+
+                # Give fp0 as much of the shortfall as its delay budget allows;
+                # trim the new pass's end for the remainder.
+                fp0_delay = min(floor_to_10s_seconds(shortfall), fp0_avail_delay)
+                remaining = shortfall - fp0_delay
+                trimmed_dur = floor_to_10s_seconds(adj_dur - remaining)
+                trim_amount = adj_dur - trimmed_dur
+                split_ok = trimmed_dur >= 0 and trim_amount <= max_trim_10
+
+                split_side_effects = []
+                if split_ok and fp0_delay > 0:
+                    new_fp0_start = ceil_to_next_10s(fp0.out_start + timedelta(seconds=fp0_delay))
+                    split_side_effects.append((j, new_fp0_start, None))
+                    # Cascade fp0's delay into fp1, fp2, ... as needed.
+                    prev_csc = new_fp0_start + timedelta(seconds=fp0.out_dur_s)
+                    for k, fp in enumerate(following[1:], start=1):
+                        min_fp_start = ceil_to_next_10s(prev_csc + timedelta(seconds=gap_seconds))
+                        if fp.out_start >= min_fp_start:
+                            break
+                        ad = int((fp.out_start - fp.start).total_seconds())
+                        en = int((min_fp_start - fp.out_start).total_seconds())
+                        if ad + en > max_start_delay:
+                            split_ok = False
+                            break
+                        split_side_effects.append((j + k, min_fp_start, None))
+                        prev_csc = min_fp_start + timedelta(seconds=fp.out_dur_s)
+
+                if split_ok:
+                    use_dur = trimmed_dur
+                    side_effects.extend(split_side_effects)
+                else:
+                    # Split infeasible; fall back to cascade-delaying following passes.
+                    for k, fp in enumerate(following):
+                        min_fp_start = ceil_to_next_10s(prev_end_dt + timedelta(seconds=gap_seconds))
+                        if fp.out_start >= min_fp_start:
+                            break  # sufficient gap; subsequent passes also unaffected
+                        already_delayed = int((fp.out_start - fp.start).total_seconds())
+                        extra_needed = int((min_fp_start - fp.out_start).total_seconds())
+                        if already_delayed + extra_needed > max_start_delay:
+                            feasible = False
+                            break
+                        side_effects.append((j + k, min_fp_start, None))
+                        prev_end_dt = min_fp_start + timedelta(seconds=fp.out_dur_s)
 
         if feasible:
             # Prefer slots with no side effects (original times preserved),
             # then earliest adjusted start, then longest duration.
-            key = (bool(side_effects), adj_start, -adj_dur)
+            key = (bool(side_effects), adj_start, -use_dur)
             best_key = (bool(best[3]), best[1], -best[2]) if best is not None else None
             if best is None or key < best_key:
-                best = (j, adj_start, adj_dur, side_effects)
+                best = (j, adj_start, use_dur, side_effects)
 
     return best
 
