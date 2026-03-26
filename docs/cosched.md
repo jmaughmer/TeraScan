@@ -105,7 +105,7 @@ Space-separated columns; lines beginning with `#` are headers or comments.
 | time | `HH:MM:SS` |
 | durat | Duration as `MM:SS` |
 
-Duplicate passes (same date, time, satellite, and telemetry) are deduplicated by keeping the entry with the lowest priority value.
+Duplicate passes are identified by matching satellite and telemetry with start times within 30 seconds of each other. The pass with the earlier start time is kept; if start times are equal, the lower priority value (higher priority) wins.
 
 ## Scheduling algorithm
 

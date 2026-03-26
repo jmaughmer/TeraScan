@@ -33,7 +33,8 @@ Input format (space-separated, header lines start with '#'):
  1  sched   3  metop-3   ahrpt    2025/08/18 230  19:08:50  12:50
 
 Assumptions:
-- Duplicate passes are identified by (date, time, satellite, telemetry).
+- Duplicate passes are identified by (satellite, telemetry) with start times within 30 seconds
+  of each other. The earlier start time is kept; the lower priority value wins on ties.
 - All passes (sched/confl/etc.) are candidates for scheduling.
 - When adjusting, we adhere to 10-second granularity; times are ceiled, durations are floored.
 
@@ -288,21 +289,39 @@ def parse_schedule(path: str) -> List[Pass]:
 
 
 def dedupe_passes(passes: List[Pass]) -> List[Pass]:
-    """Deduplicate passes by date, time, satellite, and telemetry.
+    """Deduplicate passes by satellite, telemetry, and approximate start time.
 
-    Keeps the pass with the lowest priority value for each duplicate key; on
-    equal priorities, the first encountered pass is retained. Returns the
-    deduplicated passes sorted by their start time.
+    Two passes are considered duplicates if they share the same satellite and
+    telemetry and their start times differ by at most 30 seconds. When
+    duplicates are found the pass with the earlier start time is kept; ties
+    on start time are broken by lower priority value (higher priority), then
+    first encountered.
+
+    Returns the deduplicated passes sorted by start time.
     """
-    seen = {}  # type: Dict[Tuple[str, str, str, str], Pass]
-    for p in passes:
-        key = (p.date_str, p.time_str, p.sat.lower(), p.telem.lower())
-        if key not in seen:
-            seen[key] = p
-        else:
-            if p.pri < seen[key].pri:
-                seen[key] = p
-    return sorted(seen.values(), key=lambda x: x.start)
+    NEAR_SECONDS = 30
+    sorted_passes = sorted(passes, key=lambda x: x.start)
+    result = []  # type: List[Pass]
+
+    for p in sorted_passes:
+        matched = False
+        # Scan backward through already-accepted passes; once the time gap
+        # exceeds NEAR_SECONDS all earlier entries are too far away.
+        for i in range(len(result) - 1, -1, -1):
+            existing = result[i]
+            if (p.start - existing.start).total_seconds() > NEAR_SECONDS:
+                break
+            if existing.sat.lower() == p.sat.lower() and existing.telem.lower() == p.telem.lower():
+                # Duplicate: existing has the earlier start (sorted order);
+                # adopt p's priority if it is higher (lower number).
+                if p.pri < existing.pri:
+                    existing.pri = p.pri
+                matched = True
+                break
+        if not matched:
+            result.append(p)
+
+    return sorted(result, key=lambda x: x.start)
 
 
 def format_output_line(idx: int, state: str, pri: int, sat: str, telem: str, dt: datetime, dur_s: int) -> str:
