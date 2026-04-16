@@ -255,6 +255,37 @@ def floor_to_10s_seconds(x: int) -> int:
     return (x // 10) * 10
 
 
+def floor_to_prev_10s(dt: datetime) -> datetime:
+    """Round a datetime down to the previous 10-second boundary."""
+    base = dt.replace(microsecond=0)
+    return base - timedelta(seconds=base.second % 10)
+
+
+def start_delay_seconds(original_start: datetime, adjusted_start: datetime) -> int:
+    """Return the delay in seconds between the original and adjusted start times."""
+    return int((adjusted_start - original_start).total_seconds())
+
+
+def ceil_start_within_delay(
+    original_start: datetime,
+    earliest_start: datetime,
+    max_start_delay: int,
+) -> Optional[datetime]:
+    """Return the earliest 10-second-aligned start that stays within the delay cap."""
+    adjusted_start = ceil_to_next_10s(earliest_start)
+    if start_delay_seconds(original_start, adjusted_start) > max_start_delay:
+        return None
+    return adjusted_start
+
+
+def latest_start_within_delay(original_start: datetime, max_start_delay: int) -> Optional[datetime]:
+    """Return the latest 10-second-aligned start that stays within the delay cap."""
+    latest_start = floor_to_prev_10s(original_start + timedelta(seconds=max_start_delay))
+    if latest_start < original_start:
+        return None
+    return latest_start
+
+
 def parse_schedule(path: str) -> List[Pass]:
     """
     Parse a schedule file into a list of Pass objects.
@@ -415,28 +446,29 @@ def _find_insertion(
 
         # --- Step 1: adjusted start for new pass, optionally trimming p_prev ---
         if p_prev is None:
-            adj_start = ceil_to_next_10s(p.start)
+            adj_start = ceil_start_within_delay(p.start, p.start, max_start_delay)
+            if adj_start is None:
+                continue
         else:
             prev_end = p_prev.out_start + timedelta(seconds=p_prev.out_dur_s)
             min_start = prev_end + timedelta(seconds=gap_seconds)
-            if p.start >= min_start:
-                adj_start = ceil_to_next_10s(p.start)
+            adj_start = ceil_start_within_delay(p.start, max(p.start, min_start), max_start_delay)
+            if adj_start is not None:
+                pass
             else:
-                needed = int((min_start - p.start).total_seconds())
-                if needed <= max_start_delay:
-                    adj_start = ceil_to_next_10s(p.start + timedelta(seconds=needed))
-                else:
-                    capped_start = p.start + timedelta(seconds=max_start_delay)
-                    adj_start = ceil_to_next_10s(capped_start)
-                    target_prev_end = adj_start - timedelta(seconds=gap_seconds)
-                    target_prev_dur_raw = int((target_prev_end - p_prev.out_start).total_seconds())
-                    target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
-                    min_prev_dur_allowed = max(0, floor_to_10s_seconds(p_prev.dur_s) - max_trim_10)
-                    if target_prev_dur < min_prev_dur_allowed:
-                        continue  # can't trim p_prev enough
-                    side_effects.append((j - 1, None, min(p_prev.out_dur_s, target_prev_dur)))
+                latest_start = latest_start_within_delay(p.start, max_start_delay)
+                if latest_start is None:
+                    continue
+                adj_start = latest_start
+                target_prev_end = adj_start - timedelta(seconds=gap_seconds)
+                target_prev_dur_raw = int((target_prev_end - p_prev.out_start).total_seconds())
+                target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
+                min_prev_dur_allowed = max(0, floor_to_10s_seconds(p_prev.dur_s) - max_trim_10)
+                if target_prev_dur < min_prev_dur_allowed:
+                    continue  # can't trim p_prev enough
+                side_effects.append((j - 1, None, min(p_prev.out_dur_s, target_prev_dur)))
 
-        if int((adj_start - p.start).total_seconds()) > max_start_delay:
+        if start_delay_seconds(p.start, adj_start) > max_start_delay:
             continue
 
         # --- Step 2: create required trailing gap ---
@@ -461,7 +493,7 @@ def _find_insertion(
 
                 # Give fp0 as much of the shortfall as its delay budget allows;
                 # trim the new pass's end for the remainder.
-                fp0_delay = min(floor_to_10s_seconds(shortfall), fp0_avail_delay)
+                fp0_delay = min(shortfall, floor_to_10s_seconds(fp0_avail_delay))
                 remaining = shortfall - fp0_delay
                 trimmed_dur = floor_to_10s_seconds(adj_dur - remaining)
                 trim_amount = adj_dur - trimmed_dur
@@ -469,7 +501,7 @@ def _find_insertion(
 
                 split_side_effects = []
                 if split_ok and fp0_delay > 0:
-                    new_fp0_start = ceil_to_next_10s(fp0.out_start + timedelta(seconds=fp0_delay))
+                    new_fp0_start = fp0.out_start + timedelta(seconds=fp0_delay)
                     split_side_effects.append((j, new_fp0_start, None))
                     # Cascade fp0's delay into fp1, fp2, ... as needed.
                     prev_csc = new_fp0_start + timedelta(seconds=fp0.out_dur_s)
@@ -571,37 +603,36 @@ def schedule_n_channels(
             adj_dur = floor_to_10s_seconds(p.dur_s)
 
             if prev is None:
-                adj_start = ceil_to_next_10s(p.start)
+                adj_start = ceil_start_within_delay(p.start, p.start, max_start_delay)
+                if adj_start is None:
+                    continue
                 candidates.append((i, adj_start, adj_dur, None))
                 continue
 
             prev_end = prev.out_start + timedelta(seconds=prev.out_dur_s)
             min_start = prev_end + timedelta(seconds=gap_seconds)
 
-            if p.start >= min_start:
-                adj_start = ceil_to_next_10s(p.start)
+            adj_start = ceil_start_within_delay(p.start, max(p.start, min_start), max_start_delay)
+            if adj_start is not None:
                 candidates.append((i, adj_start, adj_dur, None))
             else:
-                needed = int((min_start - p.start).total_seconds())
-                if needed <= max_start_delay:
-                    adj_start = ceil_to_next_10s(p.start + timedelta(seconds=needed))
-                    candidates.append((i, adj_start, adj_dur, None))
-                else:
-                    capped_start = p.start + timedelta(seconds=max_start_delay)
-                    adj_start = ceil_to_next_10s(capped_start)
+                latest_start = latest_start_within_delay(p.start, max_start_delay)
+                if latest_start is None:
+                    continue
+                adj_start = latest_start
 
-                    target_prev_end = adj_start - timedelta(seconds=gap_seconds)
-                    target_prev_dur_raw = int((target_prev_end - prev.out_start).total_seconds())
-                    target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
+                target_prev_end = adj_start - timedelta(seconds=gap_seconds)
+                target_prev_dur_raw = int((target_prev_end - prev.out_start).total_seconds())
+                target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
 
-                    base_prev_dur = floor_to_10s_seconds(prev.dur_s)
-                    min_prev_dur_allowed = max(0, base_prev_dur - max_trim_10)
+                base_prev_dur = floor_to_10s_seconds(prev.dur_s)
+                min_prev_dur_allowed = max(0, base_prev_dur - max_trim_10)
 
-                    if target_prev_dur < min_prev_dur_allowed:
-                        continue
+                if target_prev_dur < min_prev_dur_allowed:
+                    continue
 
-                    new_prev_dur = min(prev.out_dur_s, target_prev_dur)
-                    candidates.append((i, adj_start, adj_dur, new_prev_dur))
+                new_prev_dur = min(prev.out_dur_s, target_prev_dur)
+                candidates.append((i, adj_start, adj_dur, new_prev_dur))
 
         if not candidates:
             # Greedy append failed on all channels; try inserting at an earlier

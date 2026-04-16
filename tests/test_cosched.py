@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from contextlib import ExitStack
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -21,6 +22,23 @@ def load_cosched_module():
         raise RuntimeError("Unable to load cosched module")
     spec.loader.exec_module(module)
     return module
+
+
+def make_pass(module, start, dur_s, idx, sat=None, telem="ahrpt", pri=1):
+    sat = sat or "sat-{}".format(idx)
+    return module.Pass(
+        idx=idx,
+        state="sched",
+        pri=pri,
+        sat=sat,
+        telem=telem,
+        date_str=start.strftime("%Y/%m/%d"),
+        doy=start.timetuple().tm_yday,
+        time_str=start.strftime("%H:%M:%S"),
+        dur_str=module.seconds_to_mmss(dur_s),
+        start=start,
+        dur_s=dur_s,
+    )
 
 
 class CoschedMainRoutingTests(unittest.TestCase):
@@ -271,6 +289,52 @@ class CoschedMainRoutingTests(unittest.TestCase):
         push_local.assert_called_once_with(["local-pass"])
         clear_remote.assert_not_called()
         push_remote.assert_not_called()
+
+
+class CoschedDelayRoundingTests(unittest.TestCase):
+    def test_append_trims_previous_pass_to_keep_delay_within_cap(self):
+        cosched = load_cosched_module()
+        prev = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 170, 1, sat="prev")
+        current = make_pass(cosched, datetime(2099, 1, 1, 12, 2, 59), 120, 2, sat="current")
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [prev, current],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=180,
+            max_start_delay=180,
+        )
+
+        self.assertEqual(unscheduled, [])
+        self.assertEqual(len(channels[0]), 2)
+        self.assertEqual(channels[0][0].out_dur_s, 160)
+        self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 12, 5, 50))
+        self.assertLessEqual(
+            int((channels[0][1].out_start - current.start).total_seconds()),
+            180,
+        )
+
+    def test_insertion_split_does_not_round_following_pass_past_delay_cap(self):
+        cosched = load_cosched_module()
+        inserted = make_pass(cosched, datetime(2099, 1, 1, 12, 8, 20), 100, 1, sat="inserted")
+        following = make_pass(cosched, datetime(2099, 1, 1, 12, 10, 1), 100, 2, sat="following")
+        following.out_start = datetime(2099, 1, 1, 12, 13, 0)
+        following.out_dur_s = 100
+
+        result = cosched._find_insertion(
+            [following],
+            inserted,
+            gap_seconds=190,
+            max_trim_10=180,
+            max_start_delay=180,
+        )
+
+        self.assertIsNotNone(result)
+        insert_idx, adj_start, adj_dur, side_effects = result
+        self.assertEqual(insert_idx, 0)
+        self.assertEqual(adj_start, inserted.start)
+        self.assertEqual(adj_dur, 90)
+        self.assertEqual(side_effects, [])
 
 
 if __name__ == "__main__":
