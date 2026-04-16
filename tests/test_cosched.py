@@ -337,5 +337,29 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         self.assertEqual(side_effects, [])
 
 
+class CoschedDedupeTests(unittest.TestCase):
+    def test_near_duplicate_keeps_earlier_priority_when_starts_differ(self):
+        cosched = load_cosched_module()
+        earlier = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="metop-3", pri=5)
+        later = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 20), 100, 2, sat="metop-3", pri=1)
+
+        deduped = cosched.dedupe_passes([later, earlier])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].start, earlier.start)
+        self.assertEqual(deduped[0].pri, 5)
+
+    def test_exact_start_tie_adopts_lower_priority_value(self):
+        cosched = load_cosched_module()
+        first = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="metop-3", pri=5)
+        tied = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 2, sat="metop-3", pri=1)
+
+        deduped = cosched.dedupe_passes([first, tied])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].start, first.start)
+        self.assertEqual(deduped[0].pri, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

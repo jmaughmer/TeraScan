@@ -358,8 +358,8 @@ def dedupe_passes(passes: List[Pass]) -> List[Pass]:
                 break
             if existing.sat.lower() == p.sat.lower() and existing.telem.lower() == p.telem.lower():
                 # Duplicate: existing has the earlier start (sorted order);
-                # adopt p's priority if it is higher (lower number).
-                if p.pri < existing.pri:
+                # only exact start-time ties may inherit the higher priority.
+                if p.start == existing.start and p.pri < existing.pri:
                     existing.pri = p.pri
                 matched = True
                 break
