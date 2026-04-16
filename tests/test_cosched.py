@@ -1,3 +1,11 @@
+"""Regression tests for the coscheduler entrypoint and core scheduling helpers.
+
+The suite is intentionally split into three groups:
+- main() routing and push behavior in file and fetch modes
+- delay/rounding edge cases inside the scheduler
+- near-duplicate pass deduplication rules
+"""
+
 import importlib.util
 import sys
 import unittest
@@ -16,15 +24,17 @@ HEADER_ONLY_SCHEDULE = "#  state  pri  satel    telem       date    day    time 
 
 
 def load_cosched_module():
+    """Import scripts/cosched.py under a throwaway module name for each test."""
     spec = importlib.util.spec_from_file_location("cosched_under_test", str(COSCHED_PATH))
-    module = importlib.util.module_from_spec(spec)
-    if spec.loader is None:
+    if spec is None or spec.loader is None:
         raise RuntimeError("Unable to load cosched module")
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 def make_pass(module, start, dur_s, idx, sat=None, telem="ahrpt", pri=1):
+    """Build a Pass instance with just the fields each test needs to vary."""
     sat = sat or "sat-{}".format(idx)
     return module.Pass(
         idx=idx,
@@ -42,6 +52,8 @@ def make_pass(module, start, dur_s, idx, sat=None, telem="ahrpt", pri=1):
 
 
 class CoschedMainRoutingTests(unittest.TestCase):
+    """Exercise CLI routing, fetch-source mapping, and push abort behavior."""
+
     def test_fetch_mode_preserves_remote_targets_when_local_fetch_fails(self):
         cosched = load_cosched_module()
         schedule_n_channels = Mock(return_value=([
@@ -368,6 +380,8 @@ class CoschedMainRoutingTests(unittest.TestCase):
 
 
 class CoschedDelayRoundingTests(unittest.TestCase):
+    """Cover rounding-sensitive scheduling cases near trim and delay caps."""
+
     def test_append_trims_previous_pass_to_keep_delay_within_cap(self):
         cosched = load_cosched_module()
         prev = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 170, 1, sat="prev")
@@ -414,6 +428,8 @@ class CoschedDelayRoundingTests(unittest.TestCase):
 
 
 class CoschedDedupeTests(unittest.TestCase):
+    """Verify duplicate selection keeps the intended pass and priority."""
+
     def test_near_duplicate_keeps_earlier_priority_when_starts_differ(self):
         cosched = load_cosched_module()
         earlier = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="metop-3", pri=5)
