@@ -25,3 +25,11 @@ A collection of scripts for controlling and testing TeraScan ground station ante
 - Python 3.6+ (cosched.py, get_terascan_schedules.py)
 - TeraScan installation at `/opt/terascan` with `listsched`, `clearsched`, and `mansched` binaries
 - OpenSSH client (`ssh`) for remote operations
+
+## Testing
+
+Run the Python regression tests with:
+
+```bash
+python -m unittest discover -s tests
+```
