@@ -55,8 +55,8 @@ In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` befor
 | `--ssh-keepalive-count-max <int>` | `3` | SSH `ServerAliveCountMax` |
 | `--remote-host <host>` | — | SSH host for channel 2, 3, … (repeat for each additional channel) |
 | `--exclude-sat <sat>` | — | Exclude a satellite from **all** channels (repeat for multiple) |
-| `--local-exclude-sat <sat>` | — | Exclude a satellite from the local channel (channel 1) only (repeat for multiple) |
-| `--remote-exclude-sat <sat>` | — | Exclude a satellite from all remote channels (channels 2+) only (repeat for multiple) |
+| `--local-exclude-sat <sat>` | — | Exclude a satellite from the local target only (repeat for multiple) |
+| `--remote-exclude-sat <sat>` | — | Exclude a satellite from remote targets only (repeat for multiple) |
 | `--sat-priority <sat>=<pri>` | — | Override the priority for a satellite across **all** channels (repeat for multiple; case-insensitive) |
 
 ## Satellite exclusion
@@ -66,10 +66,14 @@ Passes for specific satellites can be excluded from scheduling on a per-channel 
 | Option | Scope |
 |--------|-------|
 | `--exclude-sat <sat>` | Excluded from all channels |
-| `--local-exclude-sat <sat>` | Excluded from channel 1 (local) only |
-| `--remote-exclude-sat <sat>` | Excluded from channels 2+ (remote) only |
+| `--local-exclude-sat <sat>` | Excluded from the local target only |
+| `--remote-exclude-sat <sat>` | Excluded from remote targets only |
 
 All three options may be repeated to exclude multiple satellites.
+
+In file mode, the local target is channel 1 and remote targets are channels 2+. In fetch mode,
+the local/remote exclusion scope follows the actual source of each successfully fetched channel,
+so a surviving remote channel still gets remote exclusions even if an earlier local fetch failed.
 
 ## Satellite priority overrides
 

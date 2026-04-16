@@ -106,6 +106,70 @@ class CoschedMainRoutingTests(unittest.TestCase):
             ],
         )
 
+    def test_fetch_mode_uses_remote_exclusions_for_surviving_remote_channels(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([
+            ["remote-a-pass"],
+            ["remote-b-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "--fetch",
+                        "--remote-host",
+                        "remote-a",
+                        "--remote-host",
+                        "remote-b",
+                        "--local-exclude-sat",
+                        "local-only",
+                        "--remote-exclude-sat",
+                        "remote-only",
+                        "--exclude-sat",
+                        "global-only",
+                    ],
+                )
+            )
+            stack.enter_context(
+                patch.object(cosched, "fetch_local_schedule", Mock(side_effect=RuntimeError("local fetch failed")))
+            )
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "fetch_remote_schedule",
+                    Mock(side_effect=lambda host: SCHEDULE_WITH_PASS),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "write_raw_schedule",
+                    Mock(side_effect=lambda label, content: "/tmp/{}.sched".format(label)),
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_remote_mansched", Mock()))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+
+            cosched.main()
+
+        self.assertEqual(
+            schedule_n_channels.call_args[1]["channel_exclude_sats"],
+            [
+                {"global-only", "remote-only"},
+                {"global-only", "remote-only"},
+            ],
+        )
+
     def test_fetch_mode_skips_header_only_remote_schedule(self):
         cosched = load_cosched_module()
         schedule_n_channels = Mock(return_value=([

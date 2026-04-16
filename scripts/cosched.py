@@ -53,7 +53,9 @@ Satellite exclusion:
 - --remote-exclude-sat SAT Exclude a satellite from all remote channels (channels 2+) only.
 
 Exclusions are case-insensitive and are applied during scheduling so excluded passes on
-one channel can still be placed on channels where they are not excluded.
+one channel can still be placed on channels where they are not excluded. In fetch mode,
+local/remote exclusions follow the actual source of each successfully fetched channel,
+even if earlier fetch failures change the surviving channel order.
 
 Satellite priority overrides:
 - --sat-priority SAT=PRIORITY  Override the scheduled priority for a satellite across all
@@ -1271,10 +1273,17 @@ def main():
     channel_exclude_sats = []
     for i in range(n_channels):
         excl = set(global_excl)
-        if i == 0:
-            excl |= local_excl
+        if args.fetch:
+            target_kind, _ = channel_targets[i]
+            if target_kind == "local":
+                excl |= local_excl
+            elif target_kind == "remote":
+                excl |= remote_excl
         else:
-            excl |= remote_excl
+            if i == 0:
+                excl |= local_excl
+            else:
+                excl |= remote_excl
         channel_exclude_sats.append(excl)
 
     for i, excl in enumerate(channel_exclude_sats, start=1):
