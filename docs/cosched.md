@@ -275,4 +275,4 @@ SSH behavior is additionally controlled by:
 - `--ssh-keepalive-interval` (default: 30)
 - `--ssh-keepalive-count-max` (default: 3)
 
-Timeouts and subprocess failures are logged to stdout/stderr. The scheduler continues where possible and reports per-host failures.
+Timeouts and subprocess failures are logged to stdout/stderr. Once the push phase begins, a `clearsched` or `mansched` failure aborts the run immediately so later channels are not modified after a failed push step.

@@ -186,6 +186,92 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_remote.assert_called_once_with("remote-a")
         push_remote.assert_called_once_with(["remote-pass"], "remote-a")
 
+    def test_file_mode_aborts_after_local_clear_failure(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([
+            ["local-pass"],
+            ["remote-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "input1.sched",
+                        "input2.sched",
+                        "--remote-host",
+                        "remote-a",
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            clear_local = stack.enter_context(
+                patch.object(cosched, "clear_tschedule", Mock(side_effect=RuntimeError("local clear failed")))
+            )
+            push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            push_remote = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_remote_mansched", Mock())
+            )
+
+            with self.assertRaises(SystemExit) as exc:
+                cosched.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        clear_local.assert_called_once_with()
+        push_local.assert_not_called()
+        clear_remote.assert_not_called()
+        push_remote.assert_not_called()
+
+    def test_file_mode_aborts_after_local_mansched_failure(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([
+            ["local-pass"],
+            ["remote-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "input1.sched",
+                        "input2.sched",
+                        "--remote-host",
+                        "remote-a",
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            push_local = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_mansched", Mock(side_effect=RuntimeError("mansched failed")))
+            )
+            clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            push_remote = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_remote_mansched", Mock())
+            )
+
+            with self.assertRaises(SystemExit) as exc:
+                cosched.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        clear_local.assert_called_once_with()
+        push_local.assert_called_once_with(["local-pass"])
+        clear_remote.assert_not_called()
+        push_remote.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

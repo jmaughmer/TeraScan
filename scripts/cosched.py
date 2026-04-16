@@ -78,6 +78,8 @@ In both modes:
 - In fetch mode, each successfully fetched channel is pushed back to the source it was
     fetched from, so partial fetch failures do not remap remote channels onto the wrong
     targets.
+- clearsched/mansched failures abort the run immediately so later channels are not
+    modified after a failed push step.
 - Passes that could not be placed on any channel (past passes, or passes blocked by gap/trim
   constraints on all channels) are written to /tmp/cosched_not_scheduled in the same
   schedule file format.
@@ -702,38 +704,45 @@ def clear_tschedule() -> None:
     """Purge the local TeraScan schedule by running clearsched.
 
     Checks that the clearsched binary exists and is executable before running.
-    Prints stdout and any non-zero exit status. Times out after TIMEOUT_SECS seconds.
+    Prints stdout on success. Raises RuntimeError on failure or timeout.
     """
     cmd = "/opt/terascan/bin/clearsched"
+    if not (os.path.isfile(cmd) and os.access(cmd, os.X_OK)):
+        raise RuntimeError("Command not found or not executable: {}".format(cmd))
     try:
-        if not (os.path.isfile(cmd) and os.access(cmd, os.X_OK)):
-            print(f"Command not found or not executable: {cmd}")
-        else:
-            print(f"Running: {cmd}")
-            result = subprocess.run(
-                [cmd],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=TIMEOUT_SECS,
-            )
-            if result.stdout:
-                print(result.stdout.strip())
-                print(f"Cleared terascan schedule")
-            if result.returncode != 0:
-                err = result.stderr.strip() if result.stderr else ""
-                print(f"Command exited with status {result.returncode}" + (f": {err}" if err else ""))
+        print(f"Running: {cmd}")
+        result = subprocess.run(
+            [cmd],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=TIMEOUT_SECS,
+        )
     except subprocess.TimeoutExpired:
-        print(f"Command timed out after {TIMEOUT_SECS}s: {cmd}")
+        raise RuntimeError("Command timed out after {}s: {}".format(TIMEOUT_SECS, cmd))
     except Exception as e:
-        print(f"Error running command: {e}")
+        raise RuntimeError("Error running command: {}".format(e))
+
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        err = result.stderr.strip() if result.stderr else ""
+        raise RuntimeError(
+            "Command exited with status {}{}".format(
+                result.returncode,
+                ": {}".format(err) if err else "",
+            )
+        )
+    print("Cleared terascan schedule")
 
 
 def clear_remote_tschedule(host: Optional[str] = None) -> None:
-    """Purge terascan schedule on a remote host via ssh."""
+    """Purge terascan schedule on a remote host via ssh.
+
+    Raises RuntimeError on failure or timeout.
+    """
     if not host:
-        print("Remote host not provided; skipping remote clearsched.")
-        return
+        raise RuntimeError("Remote host not provided; cannot run remote clearsched.")
     cmd = "/opt/terascan/bin/clearsched"
     try:
         remote_cmd = "bash -lc " + shlex.quote(
@@ -762,16 +771,22 @@ def clear_remote_tschedule(host: Optional[str] = None) -> None:
             universal_newlines=True,
             timeout=TIMEOUT_SECS,
         )
-        if result.stdout:
-            print(result.stdout.strip())
-            print("Cleared remote terascan schedule")
-        if result.returncode != 0:
-            err = result.stderr.strip() if result.stderr else ""
-            print(f"remote clearsched exited with status {result.returncode}" + (f": {err}" if err else ""))
     except subprocess.TimeoutExpired:
-        print(f"Remote clearsched timed out after {TIMEOUT_SECS}s on {host}")
+        raise RuntimeError("Remote clearsched timed out after {}s on {}".format(TIMEOUT_SECS, host))
     except Exception as e:
-        print(f"Error running remote clearsched: {e}")
+        raise RuntimeError("Error running remote clearsched: {}".format(e))
+
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        err = result.stderr.strip() if result.stderr else ""
+        raise RuntimeError(
+            "remote clearsched exited with status {}{}".format(
+                result.returncode,
+                ": {}".format(err) if err else "",
+            )
+        )
+    print("Cleared remote terascan schedule")
 
 
 def telemetry_to_chain(telem: str) -> int:
@@ -813,20 +828,22 @@ def build_mansched_args(p: Pass, overrides: Optional[Dict[str, str]] = None) -> 
 
 
 def push_schedule_to_mansched(passes: List[Pass], overrides: Optional[Dict[str, str]] = None) -> None:
-    """Invoke mansched once per pass using defaults/overrides."""
+    """Invoke mansched once per pass using defaults/overrides.
+
+    Raises RuntimeError if mansched cannot be executed successfully.
+    """
     cmd = "/opt/terascan/bin/mansched"
-    try:
-        if not (os.path.isfile(cmd) and os.access(cmd, os.X_OK)):
-            print(f"Command not found or not executable: {cmd}")
-            return
-        # Sort by start time to submit in time order
-        ordered = sorted(passes, key=lambda x: x.out_start or x.start)
-        for p in ordered:
-            dur_s = p.out_dur_s if p.out_dur_s is not None else p.dur_s
-            if dur_s <= 0:
-                continue  # skip zero-length passes
-            args = [cmd] + build_mansched_args(p, overrides)
-            print("Running:", " ".join(args))
+    if not (os.path.isfile(cmd) and os.access(cmd, os.X_OK)):
+        raise RuntimeError("Command not found or not executable: {}".format(cmd))
+
+    ordered = sorted(passes, key=lambda x: x.out_start or x.start)
+    for p in ordered:
+        dur_s = p.out_dur_s if p.out_dur_s is not None else p.dur_s
+        if dur_s <= 0:
+            continue  # skip zero-length passes
+        args = [cmd] + build_mansched_args(p, overrides)
+        print("Running:", " ".join(args))
+        try:
             result = subprocess.run(
                 args,
                 stdout=subprocess.PIPE,
@@ -834,22 +851,30 @@ def push_schedule_to_mansched(passes: List[Pass], overrides: Optional[Dict[str, 
                 universal_newlines=True,
                 timeout=TIMEOUT_SECS,
             )
-            if result.stdout:
-                print(result.stdout.strip())
-            if result.returncode != 0:
-                err = result.stderr.strip() if result.stderr else ""
-                print(f"mansched exited with status {result.returncode}" + (f": {err}" if err else ""))
-    except subprocess.TimeoutExpired:
-        print(f"mansched timed out after {TIMEOUT_SECS}s")
-    except Exception as e:
-        print(f"Error running mansched: {e}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("mansched timed out after {}s".format(TIMEOUT_SECS))
+        except Exception as e:
+            raise RuntimeError("Error running mansched: {}".format(e))
+
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.returncode != 0:
+            err = result.stderr.strip() if result.stderr else ""
+            raise RuntimeError(
+                "mansched exited with status {}{}".format(
+                    result.returncode,
+                    ": {}".format(err) if err else "",
+                )
+            )
 
 
 def push_schedule_to_remote_mansched(passes: List[Pass], host: str, overrides: Optional[Dict[str, str]] = None) -> None:
-    """Invoke mansched over ssh on the given host once per pass using defaults/overrides."""
+    """Invoke mansched over ssh on the given host once per pass using defaults/overrides.
+
+    Raises RuntimeError if the remote batch cannot be executed successfully.
+    """
     if not host:
-        print("Remote host not provided; skipping remote mansched.")
-        return
+        raise RuntimeError("Remote host not provided; cannot run remote mansched.")
     cmd = "/opt/terascan/bin/mansched"
     try:
         # Sort by start time to submit in time order, then run in a single SSH session
@@ -892,15 +917,21 @@ def push_schedule_to_remote_mansched(passes: List[Pass], host: str, overrides: O
             universal_newlines=True,
             timeout=TIMEOUT_SECS,
         )
-        if result.stdout:
-            print(result.stdout.strip())
-        if result.returncode != 0:
-            err = result.stderr.strip() if result.stderr else ""
-            print(f"remote mansched exited with status {result.returncode}" + (f": {err}" if err else ""))
     except subprocess.TimeoutExpired:
-        print(f"remote mansched timed out after {TIMEOUT_SECS}s on {host}")
+        raise RuntimeError("remote mansched timed out after {}s on {}".format(TIMEOUT_SECS, host))
     except Exception as e:
-        print(f"Error running remote mansched: {e}")
+        raise RuntimeError("Error running remote mansched: {}".format(e))
+
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        err = result.stderr.strip() if result.stderr else ""
+        raise RuntimeError(
+            "remote mansched exited with status {}{}".format(
+                result.returncode,
+                ": {}".format(err) if err else "",
+            )
+        )
 
 
 def default_output_paths(input1: str, n: int) -> List[str]:
@@ -1258,14 +1289,20 @@ def main():
     # Push each channel back to its configured target.
     for i, ch in enumerate(channels, start=1):
         target_kind, target_host = channel_targets[i - 1]
-        if target_kind == "local":
-            clear_tschedule()
-            push_schedule_to_mansched(ch)
-        elif target_kind == "remote":
-            clear_remote_tschedule(target_host)
-            push_schedule_to_remote_mansched(ch, target_host)
-        else:
-            print(f"No push target configured for channel {i}; skipping push.")
+        try:
+            if target_kind == "local":
+                clear_tschedule()
+                push_schedule_to_mansched(ch)
+            elif target_kind == "remote":
+                if target_host is None:
+                    raise RuntimeError("No remote host configured for channel {}".format(i))
+                clear_remote_tschedule(target_host)
+                push_schedule_to_remote_mansched(ch, target_host)
+            else:
+                print(f"No push target configured for channel {i}; skipping push.")
+        except RuntimeError as exc:
+            print("ERROR pushing channel {}: {}".format(i, exc), file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
