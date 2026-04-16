@@ -354,6 +354,18 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_remote.assert_not_called()
         push_remote.assert_not_called()
 
+    def test_negative_scheduling_params_rejected(self):
+        cosched = load_cosched_module()
+        for flag in ["--gap", "--max-trim", "--max-start-delay"]:
+            with self.subTest(flag=flag):
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        patch.object(sys, "argv", ["cosched.py", "--fetch", flag, "-1"])
+                    )
+                    with self.assertRaises(SystemExit) as exc:
+                        cosched.main()
+                    self.assertEqual(exc.exception.code, 2)
+
 
 class CoschedDelayRoundingTests(unittest.TestCase):
     def test_append_trims_previous_pass_to_keep_delay_within_cap(self):

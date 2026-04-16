@@ -1220,6 +1220,12 @@ def main():
         except ValueError:
             ap.error("--sat-priority priority must be an integer, got: {!r}".format(pri_str.strip()))
 
+    if args.gap < 0:
+        ap.error("--gap must be >= 0")
+    if args.max_trim < 0:
+        ap.error("--max-trim must be >= 0")
+    if args.max_start_delay < 0:
+        ap.error("--max-start-delay must be >= 0")
     if args.timeout_secs <= 0:
         ap.error("--timeout-secs must be > 0")
     if args.ssh_connect_timeout <= 0:
