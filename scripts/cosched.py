@@ -268,6 +268,20 @@ def start_delay_seconds(original_start: datetime, adjusted_start: datetime) -> i
     return int((adjusted_start - original_start).total_seconds())
 
 
+def scheduled_out_start(p: Pass) -> datetime:
+    """Return a scheduled pass start, asserting the pass has already been placed."""
+    if p.out_start is None:
+        raise RuntimeError("scheduled pass is missing out_start")
+    return p.out_start
+
+
+def scheduled_out_dur_s(p: Pass) -> int:
+    """Return a scheduled pass duration, asserting the pass has already been placed."""
+    if p.out_dur_s is None:
+        raise RuntimeError("scheduled pass is missing out_dur_s")
+    return p.out_dur_s
+
+
 def ceil_start_within_delay(
     original_start: datetime,
     earliest_start: datetime,
@@ -452,7 +466,9 @@ def _find_insertion(
             if adj_start is None:
                 continue
         else:
-            prev_end = p_prev.out_start + timedelta(seconds=p_prev.out_dur_s)
+            p_prev_start = scheduled_out_start(p_prev)
+            p_prev_dur = scheduled_out_dur_s(p_prev)
+            prev_end = p_prev_start + timedelta(seconds=p_prev_dur)
             min_start = prev_end + timedelta(seconds=gap_seconds)
             adj_start = ceil_start_within_delay(p.start, max(p.start, min_start), max_start_delay)
             if adj_start is not None:
@@ -463,12 +479,12 @@ def _find_insertion(
                     continue
                 adj_start = latest_start
                 target_prev_end = adj_start - timedelta(seconds=gap_seconds)
-                target_prev_dur_raw = int((target_prev_end - p_prev.out_start).total_seconds())
+                target_prev_dur_raw = int((target_prev_end - p_prev_start).total_seconds())
                 target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
                 min_prev_dur_allowed = max(0, floor_to_10s_seconds(p_prev.dur_s) - max_trim_10)
                 if target_prev_dur < min_prev_dur_allowed:
                     continue  # can't trim p_prev enough
-                side_effects.append((j - 1, None, min(p_prev.out_dur_s, target_prev_dur)))
+                side_effects.append((j - 1, None, min(p_prev_dur, target_prev_dur)))
 
         if start_delay_seconds(p.start, adj_start) > max_start_delay:
             continue
@@ -487,10 +503,12 @@ def _find_insertion(
 
         if following:
             fp0 = following[0]
+            fp0_start = scheduled_out_start(fp0)
+            fp0_dur = scheduled_out_dur_s(fp0)
             min_fp0_start = ceil_to_next_10s(new_end + timedelta(seconds=gap_seconds))
-            if fp0.out_start < min_fp0_start:
-                shortfall = int((min_fp0_start - fp0.out_start).total_seconds())
-                fp0_already_delayed = int((fp0.out_start - fp0.start).total_seconds())
+            if fp0_start < min_fp0_start:
+                shortfall = int((min_fp0_start - fp0_start).total_seconds())
+                fp0_already_delayed = int((fp0_start - fp0.start).total_seconds())
                 fp0_avail_delay = max(0, max_start_delay - fp0_already_delayed)
 
                 # Give fp0 as much of the shortfall as its delay budget allows;
@@ -503,21 +521,23 @@ def _find_insertion(
 
                 split_side_effects = []
                 if split_ok and fp0_delay > 0:
-                    new_fp0_start = fp0.out_start + timedelta(seconds=fp0_delay)
+                    new_fp0_start = fp0_start + timedelta(seconds=fp0_delay)
                     split_side_effects.append((j, new_fp0_start, None))
                     # Cascade fp0's delay into fp1, fp2, ... as needed.
-                    prev_csc = new_fp0_start + timedelta(seconds=fp0.out_dur_s)
+                    prev_csc = new_fp0_start + timedelta(seconds=fp0_dur)
                     for k, fp in enumerate(following[1:], start=1):
+                        fp_start = scheduled_out_start(fp)
+                        fp_dur = scheduled_out_dur_s(fp)
                         min_fp_start = ceil_to_next_10s(prev_csc + timedelta(seconds=gap_seconds))
-                        if fp.out_start >= min_fp_start:
+                        if fp_start >= min_fp_start:
                             break
-                        ad = int((fp.out_start - fp.start).total_seconds())
-                        en = int((min_fp_start - fp.out_start).total_seconds())
+                        ad = int((fp_start - fp.start).total_seconds())
+                        en = int((min_fp_start - fp_start).total_seconds())
                         if ad + en > max_start_delay:
                             split_ok = False
                             break
                         split_side_effects.append((j + k, min_fp_start, None))
-                        prev_csc = min_fp_start + timedelta(seconds=fp.out_dur_s)
+                        prev_csc = min_fp_start + timedelta(seconds=fp_dur)
 
                 if split_ok:
                     use_dur = trimmed_dur
@@ -525,24 +545,29 @@ def _find_insertion(
                 else:
                     # Split infeasible; fall back to cascade-delaying following passes.
                     for k, fp in enumerate(following):
+                        fp_start = scheduled_out_start(fp)
+                        fp_dur = scheduled_out_dur_s(fp)
                         min_fp_start = ceil_to_next_10s(prev_end_dt + timedelta(seconds=gap_seconds))
-                        if fp.out_start >= min_fp_start:
+                        if fp_start >= min_fp_start:
                             break  # sufficient gap; subsequent passes also unaffected
-                        already_delayed = int((fp.out_start - fp.start).total_seconds())
-                        extra_needed = int((min_fp_start - fp.out_start).total_seconds())
+                        already_delayed = int((fp_start - fp.start).total_seconds())
+                        extra_needed = int((min_fp_start - fp_start).total_seconds())
                         if already_delayed + extra_needed > max_start_delay:
                             feasible = False
                             break
                         side_effects.append((j + k, min_fp_start, None))
-                        prev_end_dt = min_fp_start + timedelta(seconds=fp.out_dur_s)
+                        prev_end_dt = min_fp_start + timedelta(seconds=fp_dur)
 
         if feasible:
             # Prefer slots with no side effects (original times preserved),
             # then earliest adjusted start, then longest duration.
             key = (bool(side_effects), adj_start, -use_dur)
-            best_key = (bool(best[3]), best[1], -best[2]) if best is not None else None
-            if best is None or key < best_key:
+            if best is None:
                 best = (j, adj_start, use_dur, side_effects)
+            else:
+                best_key = (bool(best[3]), best[1], -best[2])
+                if key < best_key:
+                    best = (j, adj_start, use_dur, side_effects)
 
     return best
 
@@ -611,7 +636,9 @@ def schedule_n_channels(
                 candidates.append((i, adj_start, adj_dur, None))
                 continue
 
-            prev_end = prev.out_start + timedelta(seconds=prev.out_dur_s)
+            prev_start = scheduled_out_start(prev)
+            prev_dur = scheduled_out_dur_s(prev)
+            prev_end = prev_start + timedelta(seconds=prev_dur)
             min_start = prev_end + timedelta(seconds=gap_seconds)
 
             adj_start = ceil_start_within_delay(p.start, max(p.start, min_start), max_start_delay)
@@ -624,7 +651,7 @@ def schedule_n_channels(
                 adj_start = latest_start
 
                 target_prev_end = adj_start - timedelta(seconds=gap_seconds)
-                target_prev_dur_raw = int((target_prev_end - prev.out_start).total_seconds())
+                target_prev_dur_raw = int((target_prev_end - prev_start).total_seconds())
                 target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
 
                 base_prev_dur = floor_to_10s_seconds(prev.dur_s)
@@ -633,7 +660,7 @@ def schedule_n_channels(
                 if target_prev_dur < min_prev_dur_allowed:
                     continue
 
-                new_prev_dur = min(prev.out_dur_s, target_prev_dur)
+                new_prev_dur = min(prev_dur, target_prev_dur)
                 candidates.append((i, adj_start, adj_dur, new_prev_dur))
 
         if not candidates:
@@ -648,9 +675,12 @@ def schedule_n_channels(
                     continue
                 ins_idx, adj_start, adj_dur, side_effects = result
                 key = (bool(side_effects), adj_start, -adj_dur, i)
-                best_key = (bool(best_insert[4]), best_insert[2], -best_insert[3], best_insert[0]) if best_insert is not None else None
-                if best_insert is None or key < best_key:
+                if best_insert is None:
                     best_insert = (i, ins_idx, adj_start, adj_dur, side_effects)
+                else:
+                    best_key = (bool(best_insert[4]), best_insert[2], -best_insert[3], best_insert[0])
+                    if key < best_key:
+                        best_insert = (i, ins_idx, adj_start, adj_dur, side_effects)
 
             if best_insert is None:
                 unscheduled.append(p)
@@ -686,7 +716,8 @@ def schedule_n_channels(
 
         if prev_new_dur is not None:
             prev = ch[i][-1]
-            if prev_new_dur < prev.out_dur_s:
+            prev_current_dur = scheduled_out_dur_s(prev)
+            if prev_new_dur < prev_current_dur:
                 prev.out_dur_s = prev_new_dur
 
         q = Pass(
