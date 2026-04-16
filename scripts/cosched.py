@@ -66,14 +66,18 @@ Usage (fetch mode):
 
 In fetch mode, listsched is run locally and on each --remote-host. The results are written
 to /tmp/<hostname>.sched and then used as the channel inputs automatically. The number of
-channels equals the number of successfully fetched schedules.
+channels equals the number of successfully fetched schedules that contain at least one
+pass entry. Fetches that return only the header are treated as failures.
 
 In both modes:
 - Outputs default to sibling files next to the first input: cosched_out_1 ... cosched_out_N.
-- Channel 1 is always pushed locally via clearsched + mansched.
-- Each additional channel maps to the corresponding --remote-host (in order) and is pushed
-  over SSH. If more channels than --remote-host entries, the extra channels are written
-  locally but not pushed remotely.
+- In file mode, channel 1 is pushed locally via clearsched + mansched.
+- In file mode, each additional channel maps to the corresponding --remote-host (in order)
+    and is pushed over SSH. If more channels than --remote-host entries, the extra channels
+    are written locally but not pushed remotely.
+- In fetch mode, each successfully fetched channel is pushed back to the source it was
+    fetched from, so partial fetch failures do not remap remote channels onto the wrong
+    targets.
 - Passes that could not be placed on any channel (past passes, or passes blocked by gap/trim
   constraints on all channels) are written to /tmp/cosched_not_scheduled in the same
   schedule file format.
@@ -286,6 +290,14 @@ def parse_schedule(path: str) -> List[Pass]:
             dur_s = parse_duration_to_seconds(dur_str)
             passes.append(Pass(idx, state, pri, sat, telem, date_str, doy, time_str, dur_str, start, dur_s))
     return passes
+
+
+def schedule_content_has_passes(content: str) -> bool:
+    """Return True when raw schedule content contains at least one pass entry."""
+    for line in content.splitlines():
+        if _LINE_RE.search(line):
+            return True
+    return False
 
 
 def dedupe_passes(passes: List[Pass]) -> List[Pass]:
@@ -1020,9 +1032,10 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "Co-schedule satellite pass lists into one or more gap-constrained schedules. "
-            "Channel 1 is always pushed locally; additional channels map to --remote-host "
-            "entries in order. Use --fetch to retrieve schedules automatically via listsched "
-            "before scheduling."
+            "In file mode, channel 1 is pushed locally and additional channels map to "
+            "--remote-host entries in order. In fetch mode, each successfully fetched "
+            "channel is pushed back to the source it was fetched from. Use --fetch to "
+            "retrieve schedules automatically via listsched before scheduling."
         )
     )
     ap.add_argument(
@@ -1130,16 +1143,19 @@ def main():
         # Fetch mode: run listsched locally and on each remote host, write raw
         # output to SCHED_DIR, then use those paths as inputs for scheduling.
         input_paths = []             # type: List[str]
-        effective_remote_hosts = []  # type: List[str]  # remotes whose fetch succeeded
+        channel_targets = []         # type: List[Tuple[str, Optional[str]]]
         failures = 0
 
         # Local
         local_label = sanitize_label(socket.gethostname())
         try:
             content = fetch_local_schedule()
+            if not schedule_content_has_passes(content):
+                raise RuntimeError("local schedule fetch returned no pass entries")
             path = write_raw_schedule(local_label, content)
             print(f"Fetched local schedule to {path}")
             input_paths.append(path)
+            channel_targets.append(("local", None))
         except Exception as e:
             print(f"ERROR fetching local schedule: {e}", file=sys.stderr)
             failures += 1
@@ -1149,10 +1165,12 @@ def main():
             label = sanitize_label(host)
             try:
                 content = fetch_remote_schedule(host)
+                if not schedule_content_has_passes(content):
+                    raise RuntimeError("remote schedule fetch returned no pass entries")
                 path = write_raw_schedule(label, content)
                 print(f"Fetched remote schedule from {host} to {path}")
                 input_paths.append(path)
-                effective_remote_hosts.append(host)
+                channel_targets.append(("remote", host))
             except Exception as e:
                 print(f"ERROR fetching schedule from {host}: {e}", file=sys.stderr)
                 failures += 1
@@ -1163,13 +1181,17 @@ def main():
         if failures:
             print(f"WARNING: {failures} fetch(es) failed; continuing with {len(input_paths)} schedule(s).")
 
-        # Only push back to hosts we successfully fetched from.
-        args.remote_hosts = effective_remote_hosts
-
     else:
         if not args.inputs:
             ap.error("at least one input file is required (or use --fetch to retrieve schedules automatically)")
         input_paths = args.inputs
+        channel_targets = [("local", None)]  # type: List[Tuple[str, Optional[str]]]
+        for i in range(1, len(input_paths)):
+            host_idx = i - 1
+            if host_idx < len(args.remote_hosts):
+                channel_targets.append(("remote", args.remote_hosts[host_idx]))
+            else:
+                channel_targets.append(("unmapped", None))
 
     n_channels = len(input_paths)
 
@@ -1233,21 +1255,17 @@ def main():
     write_schedule(not_sched_path, unscheduled)
     print(f"Wrote {len(unscheduled)} unscheduled passes to {not_sched_path}")
 
-    # Push schedules.
-    # Channel 1 (index 0) is always local.
-    # Channels 2..N map to --remote-host[0], --remote-host[1], ... in order.
-    # If no remote host is configured for a channel, skip the remote push and warn.
-    clear_tschedule()
-    push_schedule_to_mansched(channels[0])
-
-    for i in range(1, n_channels):
-        host_idx = i - 1
-        if host_idx < len(args.remote_hosts):
-            host = args.remote_hosts[host_idx]
-            clear_remote_tschedule(host)
-            push_schedule_to_remote_mansched(channels[i], host)
+    # Push each channel back to its configured target.
+    for i, ch in enumerate(channels, start=1):
+        target_kind, target_host = channel_targets[i - 1]
+        if target_kind == "local":
+            clear_tschedule()
+            push_schedule_to_mansched(ch)
+        elif target_kind == "remote":
+            clear_remote_tschedule(target_host)
+            push_schedule_to_remote_mansched(ch, target_host)
         else:
-            print(f"No --remote-host for channel {i + 1}; skipping remote push.")
+            print(f"No push target configured for channel {i}; skipping push.")
 
 
 if __name__ == "__main__":

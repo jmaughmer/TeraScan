@@ -1,6 +1,6 @@
 # cosched.py
 
-Merges one or more TeraScan satellite pass schedule files, deduplicates overlapping passes, and distributes the resulting passes across one or more gap-constrained output channels. Each output channel is then pushed to TeraScan via `clearsched` + `mansched` (locally for channel 1, over SSH for additional channels).
+Merges one or more TeraScan satellite pass schedule files, deduplicates overlapping passes, and distributes the resulting passes across one or more gap-constrained output channels. In file mode, channel 1 is pushed locally via `clearsched` + `mansched` and additional channels are pushed over SSH according to `--remote-host`. In fetch mode, each successfully fetched channel is pushed back to the source it was fetched from, so partial fetch failures do not remap channels onto the wrong targets. A fetched schedule that contains only the header and no pass entries is treated as a failed fetch and is not scheduled.
 
 Remote scheduling is submitted in a single SSH batch per remote channel to reduce connection overhead and timeout risk on high-latency links.
 
@@ -124,6 +124,8 @@ Passes are assigned to channels using a **priority-first, earliest-start** greed
 
 ## Channel-to-host mapping
 
+### File mode
+
 | Channel | Push target |
 |---------|------------|
 | 1 | Local (`clearsched` + `mansched`) |
@@ -132,6 +134,15 @@ Passes are assigned to channels using a **priority-first, earliest-start** greed
 | … | … |
 
 Channels without a corresponding `--remote-host` are written to the output file but not pushed remotely.
+
+### Fetch mode
+
+Each successfully fetched schedule keeps the push target it came from.
+
+- A locally fetched schedule is pushed locally.
+- A schedule fetched from `--remote-host user@host` is pushed back to `user@host`.
+- A fetched schedule with no pass entries is treated as a failed fetch and does not become a channel.
+- If some fetches fail, the remaining channels are still pushed to their original sources rather than being remapped by their compressed channel number.
 
 ## Telemetry-to-chain mapping
 
@@ -181,6 +192,8 @@ python3 cosched.py --fetch
 
 Fetches the local schedule, builds one channel, clears the local TeraScan schedule, and loads it.
 
+If the fetched output contains only the header and no pass entries, the fetch is treated as failed and no local channel is scheduled.
+
 ### Two-host fetch and co-schedule
 
 ```bash
@@ -189,6 +202,10 @@ python3 cosched.py --fetch \
 ```
 
 Fetches schedules from the local host and `antenna2`, merges and deduplicates them, builds two channels, loads channel 1 locally, and loads channel 2 on `antenna2` via SSH.
+
+If one fetch fails, only the successfully fetched schedules become channels, and each surviving channel is still pushed back to the source it came from.
+
+The same rule applies when a fetch returns only the header with no pass entries.
 
 ### Increase SSH/subprocess timeouts for slow links
 
