@@ -15,6 +15,7 @@ DEFAULT_AZ_STEP=10
 DEFAULT_EL_START=0
 DEFAULT_EL_END=0
 DEFAULT_EL_STEP=0
+DEFAULT_POSITION_TIMEOUT=120
 DEFAULT_CSV_OUTPUT="${HOME}/antenna_move_test_output_${STAMP}.csv"
 
 # Initialize with defaults (so validation/parsing never sees empty values)
@@ -26,6 +27,7 @@ AZ_STEP="$DEFAULT_AZ_STEP"
 EL_START="$DEFAULT_EL_START"
 EL_END="$DEFAULT_EL_END"
 EL_STEP="$DEFAULT_EL_STEP"
+POSITION_TIMEOUT="$DEFAULT_POSITION_TIMEOUT"
 CSV_OUTPUT="$DEFAULT_CSV_OUTPUT"
 
 die() {
@@ -93,6 +95,11 @@ while [[ $# -gt 0 ]]; do
       EL_STEP="$2"
       shift 2
       ;;
+    --position-timeout)
+      require_arg "$1" "${2-}"
+      POSITION_TIMEOUT="$2"
+      shift 2
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo "Options:"
@@ -105,6 +112,7 @@ while [[ $# -gt 0 ]]; do
       echo "      --el-start         Elevation start (default: $DEFAULT_EL_START)"
       echo "      --el-end           Elevation end (default: $DEFAULT_EL_END)"
       echo "      --el-step          Elevation step (default: $DEFAULT_EL_STEP)"
+      echo "      --position-timeout Position timeout in seconds (default: $DEFAULT_POSITION_TIMEOUT)"
       echo "  -h, --help             Show this help message"
       exit 0
       ;;
@@ -169,6 +177,11 @@ fi
 if (( EL_START != EL_END && EL_STEP <= 0 )); then
   die "EL_STEP must be greater than 0 when EL_START and EL_END differ"
 fi
+
+is_uint "$POSITION_TIMEOUT" || die "POSITION_TIMEOUT must be an integer"
+if (( POSITION_TIMEOUT <= 0 )); then
+  die "POSITION_TIMEOUT must be greater than 0"
+fi
 ## End Input Validation ##
 
 ## Functions ##
@@ -202,8 +215,10 @@ check_current_position () {
 }
 
 check_test_position () {
-  while true; do
+  local elapsed=0
+  while (( elapsed < POSITION_TIMEOUT )); do
     sleep 1
+    elapsed=$(( elapsed + 1 ))
 
     local POS AZ EL
     POS=$(ac "$TELEMETRY_CHAIN" P || true)
@@ -241,9 +256,10 @@ check_test_position () {
     # Check if within tolerance
     if (( AZ_DIFF <= 20 && EL_DIFF <= 20 )); then
       f_log "Antenna is in position within tolerance"
-      break
+      return 0
     fi
   done
+  die "Antenna did not reach target position within ${POSITION_TIMEOUT}s (Az diff: ${AZ_DIFF:-?} tenths, El diff: ${EL_DIFF:-?} tenths)"
 }
 
 configure_downconverter () {
@@ -265,12 +281,13 @@ test_azimuth_movement () {
       AZ_TEST_START="$i"
       f_log "Setting azimuth: $i"
       ac "$TELEMETRY_CHAIN" "A$i" | tee /dev/fd/3
-      f_log "Checking current position"
+      f_log "Waiting for antenna to settle"
+      check_test_position
       check_current_position
       if [[ -z "${CUR_AZ:-}" || -z "${CUR_EL:-}" ]]; then
         f_log "WARNING: Could not parse position; skipping CSV row for azimuth $i"
       else
-        echo "$(date +'%FT%TZ'),$i,$EL_TEST_START,$(to_tenths "$CUR_AZ"),$(to_tenths "$CUR_EL"),${AGC_LEVEL:-}" >> "$CSV_OUTPUT"
+        echo "$(date -u +'%FT%TZ'),$i,$EL_TEST_START,$(to_tenths "$CUR_AZ"),$(to_tenths "$CUR_EL"),${AGC_LEVEL:-}" >> "$CSV_OUTPUT"
       fi
       i=$(( i + AZ_STEP ))
     done
@@ -281,12 +298,13 @@ test_azimuth_movement () {
       AZ_TEST_START="$i"
       f_log "Setting azimuth: $i"
       ac "$TELEMETRY_CHAIN" "A$i" | tee /dev/fd/3
-      f_log "Checking current position"
+      f_log "Waiting for antenna to settle"
+      check_test_position
       check_current_position
       if [[ -z "${CUR_AZ:-}" || -z "${CUR_EL:-}" ]]; then
         f_log "WARNING: Could not parse position; skipping CSV row for azimuth $i"
       else
-        echo "$(date +'%FT%TZ'),$i,$EL_TEST_START,$(to_tenths "$CUR_AZ"),$(to_tenths "$CUR_EL"),${AGC_LEVEL:-}" >> "$CSV_OUTPUT"
+        echo "$(date -u +'%FT%TZ'),$i,$EL_TEST_START,$(to_tenths "$CUR_AZ"),$(to_tenths "$CUR_EL"),${AGC_LEVEL:-}" >> "$CSV_OUTPUT"
       fi
       i=$(( i - AZ_STEP ))
     done

@@ -30,6 +30,7 @@ antenna_move_test.sh [OPTIONS]
 | `--el-start <int>` | `0` | Starting elevation in tenths of a degree (0–900) |
 | `--el-end <int>` | `0` | Ending elevation in tenths of a degree (0–900) |
 | `--el-step <int>` | `0` | Elevation increment between steps (required > 0 when el-start ≠ el-end) |
+| `--position-timeout <int>` | `120` | Maximum seconds to wait for the antenna to reach each target position |
 | `-o, --csv-output <path>` | `~/antenna_move_test_output_<STAMP>.csv` | Path for the CSV output file |
 | `-h, --help` | | Print help and exit |
 
@@ -68,7 +69,7 @@ Written to `~/logs/antenna_move_test-<STAMP>.log`. All `f_log` messages (includi
 4. **Sweep loop** – If elevation range is non-trivial (`EL_START ≠ EL_END`), the outer loop steps through elevation; the inner loop sweeps azimuth at each elevation. If elevation is fixed, only the azimuth sweep runs.
    - Azimuth is swept **clockwise** when `AZ_START < AZ_END`, **counterclockwise** otherwise.
    - Elevation is stepped **up** when `EL_START < EL_END`, **down** otherwise.
-5. **Position check** – After each azimuth command the script reads back the actual position and AGC level and appends a row to the CSV.
+5. **Position check** – After each azimuth command the script waits for the antenna to settle within tolerance (±2.0°), then reads back the actual position and AGC level and appends a row to the CSV. If the antenna does not settle within `--position-timeout` seconds the script aborts.
 
 ## Examples
 
@@ -119,4 +120,5 @@ Common error messages:
 | `AZ_START and AZ_END must be different` | Both values are identical; no movement would occur |
 | `AZ_STEP must be greater than 0` | Zero or negative step would cause an infinite loop |
 | `EL_STEP must be greater than 0 when EL_START and EL_END differ` | Elevation range specified but no step size given |
+| `Antenna did not reach target position within <N>s` | The antenna failed to settle within the `--position-timeout` window |
 | `Missing value for <opt>` | An option flag was provided without a following value |
