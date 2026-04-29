@@ -9,6 +9,7 @@ Remote scheduling is submitted in a single SSH batch per remote channel to reduc
 | Command / Module | Purpose |
 |-----------------|---------|
 | Python 3.6+ | Runtime (compatible with RHEL 7 system Python or SCL `rh-python36`) |
+| `resched` | TeraScan binary – refreshes schedule state before fetching (fetch mode; enabled by default) |
 | `listsched` | TeraScan binary – reads the current pass schedule (fetch mode only) |
 | `clearsched` | TeraScan binary – clears the existing schedule before loading a new one |
 | `mansched` | TeraScan binary – loads individual passes into TeraScan |
@@ -32,19 +33,21 @@ cosched.py <input1> [<input2> ...] [OPTIONS]
 
 > **Tip:** Use `--sat-priority SAT=PRIORITY` to override the scheduled priority for specific satellites (see [Satellite priority overrides](#satellite-priority-overrides)).
 
-Automatically retrieve schedules by running `listsched` locally and on each `--remote-host`, then schedule the combined result:
+Automatically retrieve schedules by running `resched` then `listsched` locally and on each `--remote-host`, then schedule the combined result:
 
 ```
 cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] [OPTIONS]
 ```
 
 In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` before being used as an input.
+Use `--no-resched` to skip running `resched` before `listsched`.
 
 ## Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--fetch` | off | Fetch schedules via `listsched` instead of reading files |
+| `--no-resched` | off | In fetch mode, skip running `resched` before `listsched` |
 | `--out <path>` | `cosched_out_N` next to first input | Output path for channel N (repeat once per channel) |
 | `--gap <int>` | `190` | Minimum gap in seconds between consecutive passes on a channel |
 | `--max-trim <int>` | `180` | Maximum total duration reduction (seconds) allowed per pass |
