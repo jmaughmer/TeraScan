@@ -378,6 +378,64 @@ class CoschedMainRoutingTests(unittest.TestCase):
                         cosched.main()
                     self.assertEqual(exc.exception.code, 2)
 
+    def test_fetch_local_schedule_runs_resched_before_listsched_by_default(self):
+        cosched = load_cosched_module()
+        run_mock = Mock(return_value=Mock(returncode=0, stdout=SCHEDULE_WITH_PASS, stderr=""))
+
+        original_flag = cosched.RUN_RESCHED_BEFORE_LISTSCHED
+        cosched.RUN_RESCHED_BEFORE_LISTSCHED = True
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=True)))
+                stack.enter_context(patch.object(cosched.os, "access", Mock(return_value=True)))
+                stack.enter_context(patch.object(cosched.subprocess, "run", run_mock))
+
+                cosched.fetch_local_schedule()
+        finally:
+            cosched.RUN_RESCHED_BEFORE_LISTSCHED = original_flag
+
+        command = run_mock.call_args[0][0][2]
+        self.assertIn(cosched.RESCHED, command)
+        self.assertIn(cosched.LISTSCHED, command)
+
+    def test_fetch_local_schedule_fails_when_resched_missing(self):
+        cosched = load_cosched_module()
+
+        original_flag = cosched.RUN_RESCHED_BEFORE_LISTSCHED
+        cosched.RUN_RESCHED_BEFORE_LISTSCHED = True
+        try:
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=False)))
+                stack.enter_context(patch.object(cosched.subprocess, "run", Mock()))
+
+                with self.assertRaises(RuntimeError) as exc:
+                    cosched.fetch_local_schedule()
+        finally:
+            cosched.RUN_RESCHED_BEFORE_LISTSCHED = original_flag
+
+        self.assertIn("resched not found", str(exc.exception))
+
+    def test_no_resched_switch_skips_resched_in_fetch(self):
+        cosched = load_cosched_module()
+        run_mock = Mock(return_value=Mock(returncode=0, stdout=SCHEDULE_WITH_PASS, stderr=""))
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(sys, "argv", ["cosched.py", "--fetch", "--no-resched"]))
+            stack.enter_context(patch.object(cosched.subprocess, "run", run_mock))
+            stack.enter_context(patch.object(cosched, "write_raw_schedule", Mock(return_value="/tmp/local.sched")))
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", Mock(return_value=([[]], []))))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+
+            cosched.main()
+
+        command = run_mock.call_args[0][0][2]
+        self.assertIn(cosched.LISTSCHED, command)
+        self.assertNotIn(cosched.RESCHED, command)
+
 
 class CoschedDelayRoundingTests(unittest.TestCase):
     """Cover rounding-sensitive scheduling cases near trim and delay caps."""

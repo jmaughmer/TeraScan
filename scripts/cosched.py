@@ -70,6 +70,8 @@ In fetch mode, listsched is run locally and on each --remote-host. The results a
 to /tmp/<hostname>.sched and then used as the channel inputs automatically. The number of
 channels equals the number of successfully fetched schedules that contain at least one
 pass entry. Fetches that return only the header are treated as failures.
+By default, /opt/terascan/bin/resched is run before listsched during each fetch.
+Use --no-resched to skip that pre-step.
 
 In both modes:
 - Outputs default to sibling files next to the first input: cosched_out_1 ... cosched_out_N.
@@ -123,9 +125,11 @@ SSH_CONNECT_TIMEOUT = 30
 SSH_SERVER_ALIVE_INTERVAL = 30
 SSH_SERVER_ALIVE_COUNT_MAX = 3
 LISTSCHED = "/opt/terascan/bin/listsched"   # listsched binary path
+RESCHED = "/opt/terascan/bin/resched"       # resched binary path (fetch pre-step)
 SCHED_DIR = "/tmp"                           # directory for fetched .sched files
 SYSTEM_CONFIG = "/opt/terascan/pass/config/system.config"  # TeraScan system config
 DEFAULT_CHAIN = 1
+RUN_RESCHED_BEFORE_LISTSCHED = True
 
 _FALLBACK_CHAIN_MAP = {
     "aquadb": 1,
@@ -1029,9 +1033,19 @@ def fetch_local_schedule() -> str:
         RuntimeError: If the binary is not found, the call times out, or
             listsched exits with a non-zero status.
     """
+    if RUN_RESCHED_BEFORE_LISTSCHED:
+        if not (os.path.isfile(RESCHED) and os.access(RESCHED, os.X_OK)):
+            raise RuntimeError("resched not found or not executable at {}".format(RESCHED))
+
+    cmd = "source /opt/terascan/etc/tscan.bash_profile && "
+    if RUN_RESCHED_BEFORE_LISTSCHED:
+        cmd += "{} && {}".format(shlex.quote(RESCHED), shlex.quote(LISTSCHED))
+    else:
+        cmd += shlex.quote(LISTSCHED)
+
     try:
         proc = subprocess.run(
-            ["bash", "-c", "source /opt/terascan/etc/tscan.bash_profile; " + LISTSCHED],
+            ["bash", "-c", cmd],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -1062,9 +1076,18 @@ def fetch_remote_schedule(host: str) -> str:
         RuntimeError: If ssh is not on PATH, the call times out, or the
             remote command exits with a non-zero status.
     """
-    remote_cmd = "bash -lc " + shlex.quote(
-        "source /opt/terascan/etc/tscan.bash_profile && {}".format(shlex.quote(LISTSCHED))
-    )
+    remote_inner = "source /opt/terascan/etc/tscan.bash_profile && "
+    if RUN_RESCHED_BEFORE_LISTSCHED:
+        remote_inner += (
+            "if [ ! -x {resched} ]; then "
+            "echo 'resched not found or not executable at {resched}' >&2; "
+            "exit 127; "
+            "fi && {resched} && {listsched}"
+        ).format(resched=shlex.quote(RESCHED), listsched=shlex.quote(LISTSCHED))
+    else:
+        remote_inner += shlex.quote(LISTSCHED)
+
+    remote_cmd = "bash -lc " + shlex.quote(remote_inner)
     try:
         proc = subprocess.run(
             [
@@ -1124,6 +1147,7 @@ def write_raw_schedule(label: str, content: str) -> str:
 
 def main():
     global TIMEOUT_SECS, SSH_CONNECT_TIMEOUT, SSH_SERVER_ALIVE_INTERVAL, SSH_SERVER_ALIVE_COUNT_MAX
+    global RUN_RESCHED_BEFORE_LISTSCHED
     ap = argparse.ArgumentParser(
         description=(
             "Co-schedule satellite pass lists into one or more gap-constrained schedules. "
@@ -1143,10 +1167,16 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Fetch schedules by running listsched locally and on each --remote-host, "
+            "Fetch schedules by running resched + listsched locally and on each --remote-host, "
             "write them to {}/".format(SCHED_DIR) + "<hostname>.sched, "
             "then use those files as inputs."
         ),
+    )
+    ap.add_argument(
+        "--no-resched",
+        action="store_true",
+        default=False,
+        help="In fetch mode, do not run /opt/terascan/bin/resched before listsched.",
     )
     ap.add_argument(
         "--out",
@@ -1239,6 +1269,7 @@ def main():
     SSH_CONNECT_TIMEOUT = args.ssh_connect_timeout
     SSH_SERVER_ALIVE_INTERVAL = args.ssh_keepalive_interval
     SSH_SERVER_ALIVE_COUNT_MAX = args.ssh_keepalive_count_max
+    RUN_RESCHED_BEFORE_LISTSCHED = not args.no_resched
 
     if args.fetch:
         # Fetch mode: run listsched locally and on each remote host, write raw
