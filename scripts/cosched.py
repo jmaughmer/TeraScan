@@ -315,13 +315,40 @@ def _remove_zero_duration_passes(ch_passes: List[Pass], unscheduled: List[Pass])
     removed_indices = set()  # type: Set[int]
 
     for idx in range(len(ch_passes) - 1, -1, -1):
-        dur_s = ch_passes[idx].out_dur_s if ch_passes[idx].out_dur_s is not None else ch_passes[idx].dur_s
+        dur_s = scheduled_out_dur_s(ch_passes[idx])
         if dur_s <= 0:
-            removed.append(ch_passes.pop(idx))
+            removed_pass = ch_passes.pop(idx)
+            removed_pass.out_start = None
+            removed_pass.out_dur_s = None
+            removed.append(removed_pass)
             removed_indices.add(idx)
 
     unscheduled.extend(reversed(removed))
     return removed_indices
+
+
+def _normalized_start_for_position(
+    p: Pass,
+    ch_passes: List[Pass],
+    insert_idx: int,
+    gap_seconds: int,
+    max_start_delay: int,
+) -> datetime:
+    """Return the earliest valid start for p at insert_idx given the current channel state."""
+    prev = ch_passes[insert_idx - 1] if insert_idx > 0 else None
+    if prev is None:
+        adjusted_start = ceil_start_within_delay(p.start, p.start, max_start_delay)
+    else:
+        prev_end = scheduled_out_start(prev) + timedelta(seconds=scheduled_out_dur_s(prev))
+        adjusted_start = ceil_start_within_delay(
+            p.start,
+            max(p.start, prev_end + timedelta(seconds=gap_seconds)),
+            max_start_delay,
+        )
+
+    if adjusted_start is None:
+        raise RuntimeError("unable to normalize adjusted start within delay cap")
+    return adjusted_start
 
 
 def parse_schedule(path: str) -> List[Pass]:
@@ -725,6 +752,8 @@ def schedule_n_channels(
                     ch[i][ch_idx].out_dur_s = new_dur
             removed_indices = _remove_zero_duration_passes(ch[i], unscheduled)
             ins_idx -= sum(1 for idx in removed_indices if idx < ins_idx)
+            if removed_indices:
+                adj_start = _normalized_start_for_position(p, ch[i], ins_idx, gap_seconds, max_start_delay)
             q = Pass(
                 idx=p.idx,
                 state="sched",
@@ -752,7 +781,15 @@ def schedule_n_channels(
             prev_current_dur = scheduled_out_dur_s(prev)
             if prev_new_dur < prev_current_dur:
                 prev.out_dur_s = prev_new_dur
-                _remove_zero_duration_passes(ch[i], unscheduled)
+                removed_indices = _remove_zero_duration_passes(ch[i], unscheduled)
+                if removed_indices:
+                    adj_start = _normalized_start_for_position(
+                        p,
+                        ch[i],
+                        len(ch[i]),
+                        gap_seconds,
+                        max_start_delay,
+                    )
 
         q = Pass(
             idx=p.idx,

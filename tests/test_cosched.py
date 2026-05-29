@@ -709,8 +709,18 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         )
 
         self.assertEqual([p.sat for p in channels[0]], ["current"])
-        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 3, 10))
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 0, 10))
         self.assertEqual([p.sat for p in unscheduled], ["prev"])
+        self.assertIsNone(unscheduled[0].out_start)
+        self.assertIsNone(unscheduled[0].out_dur_s)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "unscheduled.sched"
+            cosched.write_schedule(str(path), unscheduled)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("12:00:00  01:40", content)
+        self.assertNotIn("12:00:00  00:00", content)
 
     def test_excluded_pass_on_all_channels_is_unscheduled(self):
         cosched = load_cosched_module()
@@ -761,9 +771,11 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         )
 
         self.assertEqual([p.sat for p in channels[0]], ["inserted", "following"])
-        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 3, 10))
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 0, 10))
         self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 12, 8, 0))
         self.assertEqual([p.sat for p in unscheduled], ["prev"])
+        self.assertIsNone(unscheduled[0].out_start)
+        self.assertIsNone(unscheduled[0].out_dur_s)
 
 
 class CoschedPushAndIoTests(unittest.TestCase):

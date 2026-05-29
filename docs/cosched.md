@@ -193,7 +193,7 @@ After each run, passes that were not placed on any channel are written to `/tmp/
 
 - Its original start time is already in the past, **or**
 - Every channel rejects both the append attempt and all insertion positions because the required start delay would exceed `--max-start-delay` and/or trimming surrounding passes on every channel would exceed `--max-trim`, **or**
-- Its effective duration would be reduced to zero after 10-second flooring or trimming.
+- Its effective duration would be reduced to zero after 10-second flooring or trimming. In that case, the unscheduled output preserves the original requested start time and duration.
 
 ## Examples
 
