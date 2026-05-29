@@ -116,7 +116,7 @@ import socket
 import subprocess
 import sys
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Set, Tuple
 
 
 HEADER = "#  state  pri  satel    telem       date    day    time    durat  post_process"
@@ -378,9 +378,11 @@ def dedupe_passes(passes: List[Pass]) -> List[Pass]:
                 break
             if existing.sat.lower() == p.sat.lower() and existing.telem.lower() == p.telem.lower():
                 # Duplicate: existing has the earlier start (sorted order);
-                # only exact start-time ties may inherit the higher priority.
+                # exact start-time ties are won by lower priority value.
                 if p.start == existing.start and p.pri < existing.pri:
-                    existing.pri = p.pri
+                    # Keep the full winning pass payload (duration, index, etc.),
+                    # not just the priority value.
+                    result[i] = p
                 matched = True
                 break
         if not matched:
@@ -1008,22 +1010,25 @@ def default_output_paths(input1: str, n: int) -> List[str]:
     return [os.path.join(base_dir, f"cosched_out_{i + 1}") for i in range(n)]
 
 
-def sanitize_label(host: str) -> str:
-    """Return a safe filename label derived from a host string.
+def sanitize_label(label: str) -> str:
+    """Return a safe filename label derived from an identifier string.
 
-    Strips a leading 'user@' prefix and a trailing ':port' suffix, then
-    replaces any character outside [A-Za-z0-9_.-] with '_'.
-
-    Examples::
-
-        'user@host.example.com' -> 'host.example.com'
-        'host:2222'             -> 'host'
+    Replaces any character outside [A-Za-z0-9_.-] with '_'. The full source
+    identifier is preserved as much as possible so labels from different
+    sources (for example ``user@host`` vs ``host:2222``) remain distinct.
     """
-    if "@" in host:
-        host = host.split("@", 1)[1]
-    if ":" in host:
-        host = host.split(":", 1)[0]
-    return re.sub(r"[^A-Za-z0-9_.-]", "_", host)
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+
+
+def ensure_unique_label(base_label: str, used_labels: Set[str]) -> str:
+    """Return a label unique within used_labels by appending a numeric suffix."""
+    candidate = base_label
+    suffix = 2
+    while candidate in used_labels:
+        candidate = "{}_{}".format(base_label, suffix)
+        suffix += 1
+    used_labels.add(candidate)
+    return candidate
 
 
 def fetch_local_schedule() -> str:
@@ -1276,10 +1281,14 @@ def main():
         # output to SCHED_DIR, then use those paths as inputs for scheduling.
         input_paths = []             # type: List[str]
         channel_targets = []         # type: List[Tuple[str, Optional[str]]]
+        used_labels = set()          # type: Set[str]
         failures = 0
 
         # Local
-        local_label = sanitize_label(socket.gethostname())
+        local_label = ensure_unique_label(
+            "local_{}".format(sanitize_label(socket.gethostname())),
+            used_labels,
+        )
         try:
             content = fetch_local_schedule()
             if not schedule_content_has_passes(content):
@@ -1294,7 +1303,10 @@ def main():
 
         # Remotes
         for host in args.remote_hosts:
-            label = sanitize_label(host)
+            label = ensure_unique_label(
+                "remote_{}".format(sanitize_label(host)),
+                used_labels,
+            )
             try:
                 content = fetch_remote_schedule(host)
                 if not schedule_content_has_passes(content):

@@ -240,6 +240,80 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_remote.assert_called_once_with("remote-b")
         push_remote.assert_called_once_with(["remote-pass"], "remote-b")
 
+    def test_fetch_mode_uses_unique_raw_schedule_labels_for_colliding_sources(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([
+            ["local-pass"],
+            ["remote-a-pass"],
+            ["remote-b-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "--fetch",
+                        "--remote-host",
+                        "ops@station-a:2222",
+                        "--remote-host",
+                        "station-a",
+                    ],
+                )
+            )
+            stack.enter_context(
+                patch.object(cosched.socket, "gethostname", Mock(return_value="station-a"))
+            )
+            stack.enter_context(
+                patch.object(cosched, "fetch_local_schedule", Mock(return_value=SCHEDULE_WITH_PASS))
+            )
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "fetch_remote_schedule",
+                    Mock(side_effect=lambda host: SCHEDULE_WITH_PASS),
+                )
+            )
+            write_raw = stack.enter_context(
+                patch.object(
+                    cosched,
+                    "write_raw_schedule",
+                    Mock(side_effect=lambda label, content: "/tmp/{}.sched".format(label)),
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            push_remote = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_remote_mansched", Mock())
+            )
+
+            cosched.main()
+
+        labels = [c.args[0] for c in write_raw.call_args_list]
+        self.assertEqual(len(labels), 3)
+        self.assertEqual(len(set(labels)), 3)
+        self.assertEqual(schedule_n_channels.call_args[1]["n_channels"], 3)
+        clear_local.assert_called_once_with()
+        push_local.assert_called_once_with(["local-pass"])
+        self.assertEqual(
+            clear_remote.call_args_list,
+            [call("ops@station-a:2222"), call("station-a")],
+        )
+        self.assertEqual(
+            push_remote.call_args_list,
+            [
+                call(["remote-a-pass"], "ops@station-a:2222"),
+                call(["remote-b-pass"], "station-a"),
+            ],
+        )
+
     def test_file_mode_keeps_local_then_remote_mapping(self):
         cosched = load_cosched_module()
         schedule_n_channels = Mock(return_value=([
@@ -509,6 +583,18 @@ class CoschedDedupeTests(unittest.TestCase):
         self.assertEqual(len(deduped), 1)
         self.assertEqual(deduped[0].start, first.start)
         self.assertEqual(deduped[0].pri, 1)
+
+    def test_exact_start_tie_keeps_full_payload_from_lower_priority_value(self):
+        cosched = load_cosched_module()
+        first = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="metop-3", pri=5)
+        tied = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 240, 2, sat="metop-3", pri=1)
+
+        deduped = cosched.dedupe_passes([first, tied])
+
+        self.assertEqual(len(deduped), 1)
+        self.assertEqual(deduped[0].idx, tied.idx)
+        self.assertEqual(deduped[0].dur_s, tied.dur_s)
+        self.assertEqual(deduped[0].pri, tied.pri)
 
 
 if __name__ == "__main__":

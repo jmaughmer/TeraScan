@@ -39,7 +39,10 @@ Automatically retrieve schedules by running `resched` then `listsched` locally a
 cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] [OPTIONS]
 ```
 
-In fetch mode, each fetched schedule is written to `/tmp/<hostname>.sched` before being used as an input.
+In fetch mode, each fetched schedule is written under `/tmp/` with a source-prefixed label
+(`local_<hostname>.sched` for local fetches and `remote_<host>.sched` for remote fetches)
+before being used as an input. If labels would collide, a numeric suffix is appended to keep
+them unique.
 Use `--no-resched` to skip running `resched` before `listsched`.
 
 ## Options
