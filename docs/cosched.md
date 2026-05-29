@@ -2,6 +2,8 @@
 
 Merges one or more TeraScan satellite pass schedule files, deduplicates overlapping passes, and distributes the resulting passes across one or more gap-constrained output channels. In file mode, channel 1 is pushed locally via `clearsched` + `mansched` and additional channels are pushed over SSH according to `--remote-host`. In fetch mode, each successfully fetched channel is pushed back to the source it was fetched from, so partial fetch failures do not remap channels onto the wrong targets. A fetched schedule that contains only the header and no pass entries is treated as a failed fetch and is not scheduled.
 
+Passes whose effective duration would floor or trim to zero seconds are treated as unscheduled and written to `/tmp/cosched_not_scheduled` instead of remaining on an output channel.
+
 Remote scheduling is submitted in a single SSH batch per remote channel to reduce connection overhead and timeout risk on high-latency links.
 
 ## Dependencies
@@ -129,7 +131,7 @@ Passes are assigned to channels using a **priority-first, earliest-start** greed
    - Otherwise, the previous pass's duration is trimmed (in 10-second steps) to create the gap. If trimming would exceed `--max-trim`, that channel is skipped.
 4. The channel that yields the **earliest adjusted start** is chosen; ties are broken by longest adjusted duration, then lowest channel index.
 5. If no channel can accept the pass via append, an **insertion fallback** is attempted: every position within every channel is tested, optionally trimming the preceding pass to create the required leading gap, and splitting the trailing-gap adjustment between trimming the new pass's stop time and delaying the first following pass's start, so neither pass bears the full cost. The first following pass absorbs as much of the shortfall as its remaining start-delay budget allows; the new pass is trimmed for the remainder. If cascading the first following pass's delay into later passes would exceed any later pass's start-delay budget, the algorithm falls back to cascade-delaying all following passes without trimming the new pass. If all channels reject all insertion positions, the pass is unscheduled. Insertion positions that require **no changes to already-scheduled passes** are preferred over those that modify surrounding passes; within each group the earliest adjusted start wins, then longest duration.
-6. If no insertion position is feasible on any channel, the pass is written to `/tmp/cosched_not_scheduled`.
+6. If no insertion position is feasible on any channel, or if a pass would be reduced to zero duration after 10-second flooring/trim, the pass is written to `/tmp/cosched_not_scheduled`.
 7. Start times are rounded up to the nearest 10-second boundary; durations are rounded down to the nearest 10-second boundary.
 
 ## Channel-to-host mapping
@@ -183,14 +185,15 @@ Each channel is written as a text file using the same column layout as the input
  1  sched   3  metop-3   ahrpt    2025/08/18 230  19:09:00  12:50
 ```
 
-Pass states are normalized to `sched`; start times and durations reflect any scheduling adjustments.
+Pass states are normalized to `sched`; start times and durations reflect any scheduling adjustments. Passes whose effective duration reaches zero are omitted from channel outputs and treated as unscheduled instead.
 
 ### Unscheduled passes
 
 After each run, passes that were not placed on any channel are written to `/tmp/cosched_not_scheduled` in the same format. A pass ends up in this file when:
 
 - Its original start time is already in the past, **or**
-- Every channel rejects both the append attempt and all insertion positions because the required start delay would exceed `--max-start-delay` and/or trimming surrounding passes on every channel would exceed `--max-trim`.
+- Every channel rejects both the append attempt and all insertion positions because the required start delay would exceed `--max-start-delay` and/or trimming surrounding passes on every channel would exceed `--max-trim`, **or**
+- Its effective duration would be reduced to zero after 10-second flooring or trimming.
 
 ## Examples
 

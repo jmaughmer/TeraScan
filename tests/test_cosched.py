@@ -1,8 +1,9 @@
 """Regression tests for the coscheduler entrypoint and core scheduling helpers.
 
-The suite is intentionally split into three groups:
+The suite is intentionally split into four groups:
 - main() routing and push behavior in file and fetch modes
 - delay/rounding edge cases inside the scheduler
+- push/IO helper behavior
 - near-duplicate pass deduplication rules
 """
 
@@ -591,17 +592,13 @@ class CoschedMainRoutingTests(unittest.TestCase):
         cosched = load_cosched_module()
         run_mock = Mock(return_value=Mock(returncode=0, stdout=SCHEDULE_WITH_PASS, stderr=""))
 
-        original_flag = cosched.RUN_RESCHED_BEFORE_LISTSCHED
-        cosched.RUN_RESCHED_BEFORE_LISTSCHED = True
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=True)))
-                stack.enter_context(patch.object(cosched.os, "access", Mock(return_value=True)))
-                stack.enter_context(patch.object(cosched.subprocess, "run", run_mock))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(cosched, "RUN_RESCHED_BEFORE_LISTSCHED", True))
+            stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=True)))
+            stack.enter_context(patch.object(cosched.os, "access", Mock(return_value=True)))
+            stack.enter_context(patch.object(cosched.subprocess, "run", run_mock))
 
-                cosched.fetch_local_schedule()
-        finally:
-            cosched.RUN_RESCHED_BEFORE_LISTSCHED = original_flag
+            cosched.fetch_local_schedule()
 
         command = run_mock.call_args[0][0][2]
         self.assertIn(cosched.RESCHED, command)
@@ -610,17 +607,13 @@ class CoschedMainRoutingTests(unittest.TestCase):
     def test_fetch_local_schedule_fails_when_resched_missing(self):
         cosched = load_cosched_module()
 
-        original_flag = cosched.RUN_RESCHED_BEFORE_LISTSCHED
-        cosched.RUN_RESCHED_BEFORE_LISTSCHED = True
-        try:
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=False)))
-                stack.enter_context(patch.object(cosched.subprocess, "run", Mock()))
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(cosched, "RUN_RESCHED_BEFORE_LISTSCHED", True))
+            stack.enter_context(patch.object(cosched.os.path, "isfile", Mock(return_value=False)))
+            stack.enter_context(patch.object(cosched.subprocess, "run", Mock()))
 
-                with self.assertRaises(RuntimeError) as exc:
-                    cosched.fetch_local_schedule()
-        finally:
-            cosched.RUN_RESCHED_BEFORE_LISTSCHED = original_flag
+            with self.assertRaises(RuntimeError) as exc:
+                cosched.fetch_local_schedule()
 
         self.assertIn("resched not found", str(exc.exception))
 
@@ -648,6 +641,15 @@ class CoschedMainRoutingTests(unittest.TestCase):
 
 class CoschedDelayRoundingTests(unittest.TestCase):
     """Cover rounding-sensitive scheduling cases near trim and delay caps."""
+
+    def test_short_pass_that_floors_to_zero_is_unscheduled(self):
+        cosched = load_cosched_module()
+        short_pass = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 5, 1, sat="short")
+
+        channels, unscheduled = cosched.schedule_n_channels([short_pass], n_channels=1)
+
+        self.assertEqual(channels, [[]])
+        self.assertEqual(unscheduled, [short_pass])
 
     def test_append_trims_previous_pass_to_keep_delay_within_cap(self):
         cosched = load_cosched_module()
@@ -693,6 +695,23 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         self.assertEqual(adj_dur, 90)
         self.assertEqual(side_effects, [])
 
+    def test_append_unschedules_previous_pass_trimmed_to_zero(self):
+        cosched = load_cosched_module()
+        prev = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="prev")
+        current = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 10), 100, 2, sat="current")
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [prev, current],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=100,
+            max_start_delay=180,
+        )
+
+        self.assertEqual([p.sat for p in channels[0]], ["current"])
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 3, 10))
+        self.assertEqual([p.sat for p in unscheduled], ["prev"])
+
     def test_excluded_pass_on_all_channels_is_unscheduled(self):
         cosched = load_cosched_module()
         blocked = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="blocked")
@@ -726,6 +745,25 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         )
 
         self.assertIsNone(result)
+
+    def test_insertion_unschedules_previous_pass_trimmed_to_zero(self):
+        cosched = load_cosched_module()
+        prev = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="prev", pri=1)
+        inserted = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 10), 100, 2, sat="inserted", pri=2)
+        following = make_pass(cosched, datetime(2099, 1, 1, 12, 7, 0), 200, 3, sat="following", pri=1)
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [prev, inserted, following],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=100,
+            max_start_delay=180,
+        )
+
+        self.assertEqual([p.sat for p in channels[0]], ["inserted", "following"])
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 3, 10))
+        self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 12, 8, 0))
+        self.assertEqual([p.sat for p in unscheduled], ["prev"])
 
 
 class CoschedPushAndIoTests(unittest.TestCase):

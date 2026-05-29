@@ -13,6 +13,8 @@ Scheduling rules:
     exceeding the start-delay cap, the pass is skipped.
 - Do not reduce any pass's duration by more than --max-trim seconds in total
     relative to its original duration (default: 180 seconds).
+- Passes whose effective duration would be reduced to 0 seconds after 10-second
+    flooring/trim are treated as unscheduled and written to /tmp/cosched_not_scheduled.
 - When inserting a pass between two existing passes, the required trailing gap is created
     by splitting the adjustment between trimming the new pass's stop time and delaying the
     first following pass's start, so neither pass bears the full cost. The first following
@@ -85,7 +87,8 @@ In both modes:
 - clearsched/mansched failures abort the run immediately so later channels are not
     modified after a failed push step.
 - Passes that could not be placed on any channel (past passes, or passes blocked by gap/trim
-  constraints on all channels) are written to /tmp/cosched_not_scheduled in the same
+    constraints on all channels, or passes reduced to zero duration by flooring/trim) are
+    written to /tmp/cosched_not_scheduled in the same
   schedule file format.
 - Remote mansched submissions are batched per host into a single SSH session to reduce
     connection overhead and timeout risk.
@@ -306,6 +309,21 @@ def latest_start_within_delay(original_start: datetime, max_start_delay: int) ->
     return latest_start
 
 
+def _remove_zero_duration_passes(ch_passes: List[Pass], unscheduled: List[Pass]) -> Set[int]:
+    """Remove zero-duration scheduled passes from a channel and record them as unscheduled."""
+    removed = []  # type: List[Pass]
+    removed_indices = set()  # type: Set[int]
+
+    for idx in range(len(ch_passes) - 1, -1, -1):
+        dur_s = ch_passes[idx].out_dur_s if ch_passes[idx].out_dur_s is not None else ch_passes[idx].dur_s
+        if dur_s <= 0:
+            removed.append(ch_passes.pop(idx))
+            removed_indices.add(idx)
+
+    unscheduled.extend(reversed(removed))
+    return removed_indices
+
+
 def parse_schedule(path: str) -> List[Pass]:
     """
     Parse a schedule file into a list of Pass objects.
@@ -458,6 +476,8 @@ def _find_insertion(
         wins, then longest duration.
     """
     adj_dur = floor_to_10s_seconds(p.dur_s)
+    if adj_dur <= 0:
+        return None
     best = None  # type: Optional[Tuple[int, datetime, int, List]]
 
     for j in range(len(ch_passes)):  # j=len (append) already tried by the main loop
@@ -523,7 +543,7 @@ def _find_insertion(
                 remaining = shortfall - fp0_delay
                 trimmed_dur = floor_to_10s_seconds(adj_dur - remaining)
                 trim_amount = adj_dur - trimmed_dur
-                split_ok = trimmed_dur >= 0 and trim_amount <= max_trim_10
+                split_ok = trimmed_dur > 0 and trim_amount <= max_trim_10
 
                 split_side_effects = []
                 if split_ok and fp0_delay > 0:
@@ -628,12 +648,17 @@ def schedule_n_channels(
             unscheduled.append(p)
             continue
 
+        base_adj_dur = floor_to_10s_seconds(p.dur_s)
+        if base_adj_dur <= 0:
+            unscheduled.append(p)
+            continue
+
         candidates = []  # tuples: (i, adj_start, adj_dur, prev_new_dur_or_None)
         for i in range(n_channels):
             if channel_exclude_sats and p.sat.lower() in channel_exclude_sats[i]:
                 continue
             prev = ch[i][-1] if ch[i] else None
-            adj_dur = floor_to_10s_seconds(p.dur_s)
+            adj_dur = base_adj_dur
 
             if prev is None:
                 adj_start = ceil_start_within_delay(p.start, p.start, max_start_delay)
@@ -698,6 +723,8 @@ def schedule_n_channels(
                     ch[i][ch_idx].out_start = new_start
                 if new_dur is not None:
                     ch[i][ch_idx].out_dur_s = new_dur
+            removed_indices = _remove_zero_duration_passes(ch[i], unscheduled)
+            ins_idx -= sum(1 for idx in removed_indices if idx < ins_idx)
             q = Pass(
                 idx=p.idx,
                 state="sched",
@@ -725,6 +752,7 @@ def schedule_n_channels(
             prev_current_dur = scheduled_out_dur_s(prev)
             if prev_new_dur < prev_current_dur:
                 prev.out_dur_s = prev_new_dur
+                _remove_zero_duration_passes(ch[i], unscheduled)
 
         q = Pass(
             idx=p.idx,
