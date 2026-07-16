@@ -27,13 +27,15 @@ All TeraScan binaries are expected at `/opt/terascan/bin/`. Remote SSH commands 
 
 ### File mode
 
-Provide one or more pre-existing schedule files as positional arguments:
+Provide one or more pre-existing schedule files as positional arguments. One output channel is created per input file:
 
 ```
 cosched.py <input1> [<input2> ...] [OPTIONS]
 ```
 
 > **Tip:** Use `--sat-priority SAT=PRIORITY` to override the scheduled priority for specific satellites (see [Satellite priority overrides](#satellite-priority-overrides)).
+
+### Fetch mode
 
 Automatically retrieve schedules by running `resched` then `listsched` locally and on each `--remote-host`, then schedule the combined result:
 
