@@ -327,6 +327,23 @@ def _remove_zero_duration_passes(ch_passes: List[Pass], unscheduled: List[Pass])
     return removed_indices
 
 
+def _earliest_start_after(
+    p: Pass,
+    prev: Optional[Pass],
+    gap_seconds: int,
+    max_start_delay: int,
+) -> Optional[datetime]:
+    """Return the earliest valid 10s-aligned start for p after prev, or None if the delay cap blocks it."""
+    if prev is None:
+        return ceil_start_within_delay(p.start, p.start, max_start_delay)
+    prev_end = scheduled_out_start(prev) + timedelta(seconds=scheduled_out_dur_s(prev))
+    return ceil_start_within_delay(
+        p.start,
+        max(p.start, prev_end + timedelta(seconds=gap_seconds)),
+        max_start_delay,
+    )
+
+
 def _normalized_start_for_position(
     p: Pass,
     ch_passes: List[Pass],
@@ -336,16 +353,7 @@ def _normalized_start_for_position(
 ) -> datetime:
     """Return the earliest valid start for p at insert_idx given the current channel state."""
     prev = ch_passes[insert_idx - 1] if insert_idx > 0 else None
-    if prev is None:
-        adjusted_start = ceil_start_within_delay(p.start, p.start, max_start_delay)
-    else:
-        prev_end = scheduled_out_start(prev) + timedelta(seconds=scheduled_out_dur_s(prev))
-        adjusted_start = ceil_start_within_delay(
-            p.start,
-            max(p.start, prev_end + timedelta(seconds=gap_seconds)),
-            max_start_delay,
-        )
-
+    adjusted_start = _earliest_start_after(p, prev, gap_seconds, max_start_delay)
     if adjusted_start is None:
         raise RuntimeError("unable to normalize adjusted start within delay cap")
     return adjusted_start
@@ -537,7 +545,15 @@ def _find_insertion(
                 min_prev_dur_allowed = max(0, floor_to_10s_seconds(p_prev.dur_s) - max_trim_10)
                 if target_prev_dur < min_prev_dur_allowed:
                     continue  # can't trim p_prev enough
-                side_effects.append((j - 1, None, min(p_prev_dur, target_prev_dur)))
+                new_prev_dur = min(p_prev_dur, target_prev_dur)
+                if new_prev_dur <= 0:
+                    # Trimming p_prev to zero removes it from the channel; only
+                    # accept if p can still start after the pass that would
+                    # become its new predecessor within the delay cap.
+                    new_prev = ch_passes[j - 2] if j > 1 else None
+                    if _earliest_start_after(p, new_prev, gap_seconds, max_start_delay) is None:
+                        continue
+                side_effects.append((j - 1, None, new_prev_dur))
 
         if start_delay_seconds(p.start, adj_start) > max_start_delay:
             continue
@@ -719,6 +735,13 @@ def schedule_n_channels(
                     continue
 
                 new_prev_dur = min(prev_dur, target_prev_dur)
+                if new_prev_dur <= 0:
+                    # Trimming prev to zero removes it from the channel; only
+                    # accept if p can still start after the pass that would
+                    # become its new predecessor within the delay cap.
+                    new_prev = ch[i][-2] if len(ch[i]) > 1 else None
+                    if _earliest_start_after(p, new_prev, gap_seconds, max_start_delay) is None:
+                        continue
                 candidates.append((i, adj_start, adj_dur, new_prev_dur))
 
         if not candidates:

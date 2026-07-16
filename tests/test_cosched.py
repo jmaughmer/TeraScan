@@ -756,6 +756,58 @@ class CoschedDelayRoundingTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_append_trim_to_zero_falls_back_when_predecessor_blocks_delay_cap(self):
+        # Regression: appending late-pri used to trim "second" to zero, remove it,
+        # then crash with RuntimeError because the renormalized start against
+        # "first" exceeded the delay cap. The candidate must be rejected instead,
+        # letting the insertion fallback place the pass without removing anything.
+        cosched = load_cosched_module()
+        first = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 240, 1, sat="first", pri=1)
+        second = make_pass(cosched, datetime(2099, 1, 1, 12, 8, 0), 100, 2, sat="second", pri=1)
+        late_pri = make_pass(cosched, datetime(2099, 1, 1, 12, 4, 0), 100, 3, sat="late-pri", pri=2)
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [first, second, late_pri],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=180,
+            max_start_delay=180,
+        )
+
+        self.assertEqual(unscheduled, [])
+        self.assertEqual([p.sat for p in channels[0]], ["first", "late-pri", "second"])
+        self.assertEqual(channels[0][0].out_dur_s, 230)
+        self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 12, 7, 0))
+        self.assertEqual(channels[0][1].out_dur_s, 50)
+        self.assertEqual(channels[0][2].out_start, datetime(2099, 1, 1, 12, 11, 0))
+
+    def test_insertion_trim_to_zero_rejected_when_predecessor_blocks_delay_cap(self):
+        # Regression: with "third" too long to trim, the append attempt fails and
+        # insertion between "second" and "third" used to trim "second" to zero,
+        # remove it, then crash renormalizing against "first". That position must
+        # be rejected so the insertion between "first" and "second" wins instead.
+        cosched = load_cosched_module()
+        first = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 240, 1, sat="first", pri=1)
+        second = make_pass(cosched, datetime(2099, 1, 1, 12, 8, 0), 100, 2, sat="second", pri=1)
+        third = make_pass(cosched, datetime(2099, 1, 1, 12, 16, 0), 400, 3, sat="third", pri=1)
+        late_pri = make_pass(cosched, datetime(2099, 1, 1, 12, 4, 0), 100, 4, sat="late-pri", pri=2)
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [first, second, third, late_pri],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=180,
+            max_start_delay=180,
+        )
+
+        self.assertEqual(unscheduled, [])
+        self.assertEqual([p.sat for p in channels[0]], ["first", "late-pri", "second", "third"])
+        self.assertEqual(channels[0][0].out_dur_s, 230)
+        self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 12, 7, 0))
+        self.assertEqual(channels[0][1].out_dur_s, 50)
+        self.assertEqual(channels[0][2].out_start, datetime(2099, 1, 1, 12, 11, 0))
+        self.assertEqual(channels[0][3].out_start, datetime(2099, 1, 1, 12, 16, 0))
+
     def test_insertion_unschedules_previous_pass_trimmed_to_zero(self):
         cosched = load_cosched_module()
         prev = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 100, 1, sat="prev", pri=1)
