@@ -26,7 +26,7 @@ Scheduling rules:
     trimmed for the remainder. If the cascade from delaying the first following pass
     exceeds any later pass's start-delay budget, the algorithm falls back to cascade-
     delaying all following passes without trimming the new pass.
-- Passes whose original start time is in the past are skipped.
+- Passes whose original start time is in the past (by the host's local clock) are skipped.
 - Assignment is greedy: passes are processed in priority order (lower number = higher
     priority), then by start time within each priority level. Each pass is placed on the
     channel that allows the earliest adjusted start via greedy append; ties resolved by
@@ -37,6 +37,8 @@ Scheduling rules:
 Input format (space-separated, header lines start with '#'):
 #  state  pri  satel    telem       date    day    time    durat  post_process
  1  sched   3  metop-3   ahrpt    2025/08/18 230  19:08:50  12:50
+
+The post_process column is ignored, and lines that do not match this layout are skipped.
 
 Assumptions:
 - Duplicate passes are identified by (satellite, telemetry) with start times within 30 seconds
@@ -67,14 +69,16 @@ even if earlier fetch failures change the surviving channel order.
 Satellite priority overrides:
 - --sat-priority SAT=PRIORITY  Override the scheduled priority for a satellite across all
     channels (repeat for multiple; case-insensitive). Applied after scheduling, before
-    writing output files and submitting to mansched. Takes precedence over priorities in
-    the input schedule.
+    writing output files and submitting to mansched, so it does not change which passes
+    are scheduled or on which channel; it only sets the priority recorded in the outputs
+    and passed to mansched. Unscheduled passes keep their input priority.
 
 Usage (fetch mode):
     cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] ...
 
 In fetch mode, listsched is run locally and on each --remote-host. The results are written
-to /tmp/<hostname>.sched and then used as the channel inputs automatically. The number of
+to /tmp/local_<hostname>.sched and /tmp/remote_<host>.sched and then used as the channel
+inputs automatically. The number of
 channels equals the number of successfully fetched schedules that contain at least one
 pass entry. Fetches that return only the header are treated as failures.
 By default, /opt/terascan/bin/resched is run before listsched during each fetch.
@@ -1367,8 +1371,8 @@ def main():
         default=False,
         help=(
             "Fetch schedules by running resched + listsched locally and on each --remote-host, "
-            "write them to {}/".format(SCHED_DIR) + "<hostname>.sched, "
-            "then use those files as inputs."
+            "write them to {0}/local_<hostname>.sched and {0}/remote_<host>.sched, "
+            "then use those files as inputs.".format(SCHED_DIR)
         ),
     )
     ap.add_argument(
@@ -1392,7 +1396,15 @@ def main():
     ap.add_argument("--gap", type=int, default=190, help="Minimum gap in seconds between passes on a channel (default: 190)")
     ap.add_argument("--max-trim", type=int, default=180, help="Maximum total duration reduction allowed per pass in seconds (default: 180)")
     ap.add_argument("--max-start-delay", type=int, default=180, help="Maximum start delay allowed for a pass in seconds (default: 180)")
-    ap.add_argument("--timeout-secs", type=int, default=TIMEOUT_SECS, help="Subprocess timeout in seconds for clearsched/mansched/listsched/ssh calls (default: 120)")
+    ap.add_argument(
+        "--timeout-secs",
+        type=int,
+        default=TIMEOUT_SECS,
+        help=(
+            "Subprocess timeout in seconds for clearsched/mansched/listsched/ssh calls (default: 120). "
+            "A remote mansched batch also gets --remote-batch-secs-per-pass for each pass."
+        ),
+    )
     ap.add_argument("--ssh-connect-timeout", type=int, default=SSH_CONNECT_TIMEOUT, help="SSH connection timeout in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-interval", type=int, default=SSH_SERVER_ALIVE_INTERVAL, help="SSH ServerAliveInterval in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-count-max", type=int, default=SSH_SERVER_ALIVE_COUNT_MAX, help="SSH ServerAliveCountMax (default: 3)")
@@ -1411,7 +1423,10 @@ def main():
         action="append",
         default=[],
         metavar="HOST",
-        help="Remote host for channel 2, 3, ... (repeat for each additional channel; e.g. user@host)",
+        help=(
+            "Remote station as an SSH target, e.g. user@host (repeat for each station). File mode: push "
+            "target for channel 2, 3, ... in order. Fetch mode: also a schedule source."
+        ),
     )
     ap.add_argument(
         "--exclude-sat",
@@ -1446,7 +1461,8 @@ def main():
         help=(
             "Override the priority for a specific satellite (e.g. metop-3=2). "
             "Repeat for multiple satellites. Case-insensitive. "
-            "Applies to all channels and takes precedence over priorities in the input schedule."
+            "Applied to all channels after scheduling: it sets the priority written to the output "
+            "files and passed to mansched, but does not change which passes are scheduled."
         ),
     )
     args = ap.parse_args()

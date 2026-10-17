@@ -1,10 +1,12 @@
 """Regression tests for the coscheduler entrypoint and core scheduling helpers.
 
-The suite is intentionally split into four groups:
+The suite is intentionally split into five groups:
 - main() routing and push behavior in file and fetch modes
 - delay/rounding edge cases inside the scheduler
-- push/IO helper behavior
+- push/IO helper behavior, including remote chain maps and batch timeouts
 - near-duplicate pass deduplication rules
+- the generated remote mansched batch script, run in a local bash with stub paths
+  (skipped when bash is unavailable)
 """
 
 import importlib.util
