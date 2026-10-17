@@ -1,17 +1,24 @@
 """Regression tests for the coscheduler entrypoint and core scheduling helpers.
 
-The suite is intentionally split into four groups:
+The suite is intentionally split into five groups:
 - main() routing and push behavior in file and fetch modes
 - delay/rounding edge cases inside the scheduler
-- push/IO helper behavior
+- push/IO helper behavior, including remote chain maps and batch timeouts
 - near-duplicate pass deduplication rules
+- the generated remote mansched batch script, run in a local bash with stub paths
+  (skipped when bash is unavailable)
 """
 
 import importlib.util
+import io
+import os
+import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, call, patch
@@ -23,6 +30,22 @@ SCHEDULE_WITH_PASS = """#  state  pri  satel    telem       date    day    time 
  1  sched   3  metop-3   ahrpt    2026/04/17 107  19:08:50  12:50
 """
 HEADER_ONLY_SCHEDULE = "#  state  pri  satel    telem       date    day    time    durat  post_process\n"
+REMOTE_CHAIN_MAP = {"ahrpt": 7}
+PROFILE_PATH = "/opt/terascan/etc/tscan.bash_profile"
+MANSCHED_PATH = "/opt/terascan/bin/mansched"
+
+
+def find_bash():
+    """Return a usable bash path, or None. Skips the WSL launcher on Windows."""
+    bash = shutil.which("bash")
+    if bash and os.name == "nt":
+        windows_dir = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))
+        if os.path.normcase(bash).startswith(windows_dir):
+            return None
+    return bash
+
+
+BASH = find_bash()
 
 
 def load_cosched_module():
@@ -51,6 +74,11 @@ def make_pass(module, start, dur_s, idx, sat=None, telem="ahrpt", pri=1):
         start=start,
         dur_s=dur_s,
     )
+
+
+def chain_map_mock():
+    """Stand-in for fetch_remote_telemetry_chain_map so main() tests never open SSH."""
+    return Mock(return_value=REMOTE_CHAIN_MAP)
 
 
 class CoschedMainRoutingTests(unittest.TestCase):
@@ -99,6 +127,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -115,8 +144,8 @@ class CoschedMainRoutingTests(unittest.TestCase):
         self.assertEqual(
             push_remote.call_args_list,
             [
-                call(["remote-a-pass"], "remote-a"),
-                call(["remote-b-pass"], "remote-b"),
+                call(["remote-a-pass"], "remote-a", chain_map=REMOTE_CHAIN_MAP),
+                call(["remote-b-pass"], "remote-b", chain_map=REMOTE_CHAIN_MAP),
             ],
         )
 
@@ -168,6 +197,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -227,6 +257,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -240,7 +271,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_local.assert_called_once_with()
         push_local.assert_called_once_with(["local-pass"])
         clear_remote.assert_called_once_with("remote-b")
-        push_remote.assert_called_once_with(["remote-pass"], "remote-b")
+        push_remote.assert_called_once_with(["remote-pass"], "remote-b", chain_map=REMOTE_CHAIN_MAP)
 
     def test_fetch_mode_uses_unique_raw_schedule_labels_for_colliding_sources(self):
         cosched = load_cosched_module()
@@ -289,6 +320,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -298,7 +330,8 @@ class CoschedMainRoutingTests(unittest.TestCase):
 
             cosched.main()
 
-        labels = [c.args[0] for c in write_raw.call_args_list]
+        # c[0] is the positional-args tuple; call.args needs Python 3.8+.
+        labels = [c[0][0] for c in write_raw.call_args_list]
         self.assertEqual(len(labels), 3)
         self.assertEqual(len(set(labels)), 3)
         self.assertEqual(schedule_n_channels.call_args[1]["n_channels"], 3)
@@ -311,8 +344,8 @@ class CoschedMainRoutingTests(unittest.TestCase):
         self.assertEqual(
             push_remote.call_args_list,
             [
-                call(["remote-a-pass"], "ops@station-a:2222"),
-                call(["remote-b-pass"], "station-a"),
+                call(["remote-a-pass"], "ops@station-a:2222", chain_map=REMOTE_CHAIN_MAP),
+                call(["remote-b-pass"], "station-a", chain_map=REMOTE_CHAIN_MAP),
             ],
         )
 
@@ -341,6 +374,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -354,7 +388,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_local.assert_called_once_with()
         push_local.assert_called_once_with(["local-pass"])
         clear_remote.assert_called_once_with("remote-a")
-        push_remote.assert_called_once_with(["remote-pass"], "remote-a")
+        push_remote.assert_called_once_with(["remote-pass"], "remote-a", chain_map=REMOTE_CHAIN_MAP)
 
     def test_file_mode_aborts_after_local_clear_failure(self):
         cosched = load_cosched_module()
@@ -381,6 +415,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(
                 patch.object(cosched, "clear_tschedule", Mock(side_effect=RuntimeError("local clear failed")))
             )
@@ -424,6 +459,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(
                 patch.object(cosched, "push_schedule_to_mansched", Mock(side_effect=RuntimeError("mansched failed")))
@@ -444,7 +480,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
 
     def test_negative_scheduling_params_rejected(self):
         cosched = load_cosched_module()
-        for flag in ["--gap", "--max-trim", "--max-start-delay"]:
+        for flag in ["--gap", "--max-trim", "--max-start-delay", "--remote-batch-secs-per-pass"]:
             with self.subTest(flag=flag):
                 with ExitStack() as stack:
                     stack.enter_context(
@@ -542,6 +578,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
             stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
             stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
             write_schedule = stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
             clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
             push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
             clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
@@ -556,7 +593,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
         clear_local.assert_called_once_with()
         push_local.assert_called_once_with(["local-pass"])
         clear_remote.assert_called_once_with("remote-a")
-        push_remote.assert_called_once_with(["remote-pass"], "remote-a")
+        push_remote.assert_called_once_with(["remote-pass"], "remote-a", chain_map=REMOTE_CHAIN_MAP)
 
     def test_sat_priority_override_applies_case_insensitively(self):
         cosched = load_cosched_module()
@@ -637,6 +674,209 @@ class CoschedMainRoutingTests(unittest.TestCase):
         command = run_mock.call_args[0][0][2]
         self.assertIn(cosched.LISTSCHED, command)
         self.assertNotIn(cosched.RESCHED, command)
+
+    def test_fetch_mode_out_paths_follow_source_when_local_fetch_fails(self):
+        # Regression: --out values were assigned by surviving channel number, so a
+        # failed local fetch wrote the remote schedule to the local --out path.
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([["remote-a-pass"]], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "--fetch",
+                        "--remote-host",
+                        "remote-a",
+                        "--out",
+                        "local.out",
+                        "--out",
+                        "remote.out",
+                    ],
+                )
+            )
+            stack.enter_context(
+                patch.object(cosched, "fetch_local_schedule", Mock(side_effect=RuntimeError("local fetch failed")))
+            )
+            stack.enter_context(patch.object(cosched, "fetch_remote_schedule", Mock(return_value=SCHEDULE_WITH_PASS)))
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "write_raw_schedule",
+                    Mock(side_effect=lambda label, content: "/tmp/{}.sched".format(label)),
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            write_schedule = stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
+            stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_remote_mansched", Mock()))
+
+            cosched.main()
+
+        channel_writes = [c for c in write_schedule.call_args_list if c[0][0] != "/tmp/cosched_not_scheduled"]
+        self.assertEqual(channel_writes, [call("remote.out", ["remote-a-pass"])])
+
+    def test_fetch_mode_default_out_paths_follow_source_slot(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([["local-pass"], ["remote-b-pass"]], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "--fetch",
+                        "--remote-host",
+                        "remote-a",
+                        "--remote-host",
+                        "remote-b",
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(cosched, "fetch_local_schedule", Mock(return_value=SCHEDULE_WITH_PASS)))
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "fetch_remote_schedule",
+                    Mock(side_effect=[RuntimeError("remote-a fetch failed"), SCHEDULE_WITH_PASS]),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "write_raw_schedule",
+                    Mock(side_effect=lambda label, content: "/tmp/{}.sched".format(label)),
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            write_schedule = stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", chain_map_mock()))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_remote_mansched", Mock()))
+
+            cosched.main()
+
+        channel_writes = [
+            (Path(c[0][0]).name, c[0][1])
+            for c in write_schedule.call_args_list
+            if c[0][0] != "/tmp/cosched_not_scheduled"
+        ]
+        self.assertEqual(
+            channel_writes,
+            [("cosched_out_1", ["local-pass"]), ("cosched_out_3", ["remote-b-pass"])],
+        )
+
+    def test_remote_push_uses_each_remote_hosts_chain_map(self):
+        # Regression: remote mansched submissions used the local station's
+        # telemetry -> chain map, loading passes on the wrong remote chain.
+        cosched = load_cosched_module()
+        chain_maps = {"remote-a": {"ahrpt": 4}, "remote-b": {"ahrpt": 6}}
+        fetch_chain_map = Mock(side_effect=lambda host: chain_maps[host])
+        schedule_n_channels = Mock(return_value=([
+            ["local-pass"],
+            ["remote-a-pass"],
+            ["remote-b-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "input1.sched",
+                        "input2.sched",
+                        "input3.sched",
+                        "--remote-host",
+                        "remote-a",
+                        "--remote-host",
+                        "remote-b",
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "fetch_remote_telemetry_chain_map", fetch_chain_map))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            push_remote = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_remote_mansched", Mock())
+            )
+
+            cosched.main()
+
+        self.assertEqual(fetch_chain_map.call_args_list, [call("remote-a"), call("remote-b")])
+        self.assertEqual(
+            push_remote.call_args_list,
+            [
+                call(["remote-a-pass"], "remote-a", chain_map={"ahrpt": 4}),
+                call(["remote-b-pass"], "remote-b", chain_map={"ahrpt": 6}),
+            ],
+        )
+
+    def test_unreachable_remote_aborts_before_any_station_is_cleared(self):
+        cosched = load_cosched_module()
+        schedule_n_channels = Mock(return_value=([
+            ["local-pass"],
+            ["remote-pass"],
+        ], []))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "cosched.py",
+                        "input1.sched",
+                        "input2.sched",
+                        "--remote-host",
+                        "remote-a",
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", schedule_n_channels))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(
+                patch.object(
+                    cosched,
+                    "fetch_remote_telemetry_chain_map",
+                    Mock(side_effect=RuntimeError("ssh to remote-a failed (exit 255): ")),
+                )
+            )
+            clear_local = stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            push_local = stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+            clear_remote = stack.enter_context(patch.object(cosched, "clear_remote_tschedule", Mock()))
+            push_remote = stack.enter_context(
+                patch.object(cosched, "push_schedule_to_remote_mansched", Mock())
+            )
+
+            with self.assertRaises(SystemExit) as exc:
+                cosched.main()
+
+        self.assertEqual(exc.exception.code, 1)
+        clear_local.assert_not_called()
+        push_local.assert_not_called()
+        clear_remote.assert_not_called()
+        push_remote.assert_not_called()
 
 
 class CoschedDelayRoundingTests(unittest.TestCase):
@@ -829,6 +1069,56 @@ class CoschedDelayRoundingTests(unittest.TestCase):
         self.assertIsNone(unscheduled[0].out_start)
         self.assertIsNone(unscheduled[0].out_dur_s)
 
+    def test_append_does_not_evict_later_short_pass(self):
+        # Regression: the append path treated the channel's last pass as the
+        # predecessor even when it started hours after the new pass, "trimmed" it
+        # to zero and dropped it. Both passes fit without touching each other.
+        cosched = load_cosched_module()
+        later_short = make_pass(cosched, datetime(2099, 1, 1, 18, 0, 0), 170, 1, sat="later-short", pri=1)
+        earlier = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 600, 2, sat="earlier", pri=2)
+
+        channels, unscheduled = cosched.schedule_n_channels([later_short, earlier], n_channels=1)
+
+        self.assertEqual(unscheduled, [])
+        self.assertEqual([p.sat for p in channels[0]], ["earlier", "later-short"])
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 0, 0))
+        self.assertEqual(channels[0][1].out_start, datetime(2099, 1, 1, 18, 0, 0))
+        self.assertEqual(channels[0][1].out_dur_s, 170)
+
+    def test_append_does_not_evict_later_short_pass_after_real_predecessor(self):
+        cosched = load_cosched_module()
+        first = make_pass(cosched, datetime(2099, 1, 1, 11, 0, 0), 600, 1, sat="first", pri=1)
+        later_short = make_pass(cosched, datetime(2099, 1, 1, 18, 0, 0), 170, 2, sat="later-short", pri=1)
+        middle = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 600, 3, sat="middle", pri=2)
+
+        channels, unscheduled = cosched.schedule_n_channels([first, later_short, middle], n_channels=1)
+
+        self.assertEqual(unscheduled, [])
+        self.assertEqual([p.sat for p in channels[0]], ["first", "middle", "later-short"])
+        self.assertEqual(channels[0][2].out_dur_s, 170)
+
+    def test_insertion_does_not_trim_pass_that_starts_after_inserted_pass(self):
+        # Regression: insertion after "following" trimmed it to zero even though it
+        # starts after the inserted pass, evicting a higher-priority pass. Only the
+        # pass before the insertion point may be trimmed, so "inserted" is rejected.
+        cosched = load_cosched_module()
+        following = make_pass(cosched, datetime(2099, 1, 1, 12, 8, 0), 100, 1, sat="following", pri=1)
+        last = make_pass(cosched, datetime(2099, 1, 1, 14, 0, 0), 600, 2, sat="last", pri=1)
+        inserted = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 600, 3, sat="inserted", pri=2)
+
+        channels, unscheduled = cosched.schedule_n_channels(
+            [following, last, inserted],
+            n_channels=1,
+            gap_seconds=190,
+            max_trim_seconds=100,
+            max_start_delay=180,
+        )
+
+        self.assertEqual([p.sat for p in channels[0]], ["following", "last"])
+        self.assertEqual(channels[0][0].out_start, datetime(2099, 1, 1, 12, 8, 0))
+        self.assertEqual(channels[0][0].out_dur_s, 100)
+        self.assertEqual([p.sat for p in unscheduled], ["inserted"])
+
 
 class CoschedPushAndIoTests(unittest.TestCase):
     """Validate command assembly/order and output-path sanitation helpers."""
@@ -884,6 +1174,111 @@ class CoschedPushAndIoTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             cosched.write_raw_schedule("", "payload")
 
+    def test_fetch_remote_telemetry_chain_map_parses_remote_config(self):
+        cosched = load_cosched_module()
+        config = "[system]\nname = gs2\n\n[1]\ntelemetry.name = NPPDB\n\n[2]\ntelemetry.name = ahrpt\n"
+        run_mock = Mock(return_value=Mock(returncode=0, stdout=config, stderr=""))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            chain_map = cosched.fetch_remote_telemetry_chain_map("remote-a")
+
+        self.assertEqual(chain_map, {"nppdb": 1, "ahrpt": 2})
+        ssh_args = run_mock.call_args[0][0]
+        self.assertEqual(ssh_args[0], "ssh")
+        self.assertIn("remote-a", ssh_args)
+        self.assertIn(cosched.SYSTEM_CONFIG, ssh_args[-1])
+
+    def test_fetch_remote_telemetry_chain_map_falls_back_when_remote_config_missing(self):
+        cosched = load_cosched_module()
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+        err = io.StringIO()
+
+        with patch.object(cosched.subprocess, "run", run_mock), redirect_stderr(err):
+            chain_map = cosched.fetch_remote_telemetry_chain_map("remote-a")
+
+        self.assertEqual(chain_map, cosched._FALLBACK_CHAIN_MAP)
+        self.assertIn("using built-in defaults", err.getvalue())
+
+    def test_fetch_remote_telemetry_chain_map_raises_on_ssh_failure(self):
+        cosched = load_cosched_module()
+        run_mock = Mock(return_value=Mock(returncode=255, stdout="", stderr="Permission denied"))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            with self.assertRaises(RuntimeError) as exc:
+                cosched.fetch_remote_telemetry_chain_map("remote-a")
+
+        self.assertIn("failed (exit 255)", str(exc.exception))
+
+    def test_push_schedule_to_remote_mansched_uses_given_chain_map(self):
+        cosched = load_cosched_module()
+        scheduled = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="metop-3", telem="ahrpt")
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            cosched.push_schedule_to_remote_mansched([scheduled], "remote-a", chain_map={"ahrpt": 7})
+
+        remote_cmd = run_mock.call_args[0][0][-1]
+        self.assertIn("chain=7", remote_cmd)
+
+    def test_unknown_telemetry_warns_and_uses_default_chain(self):
+        cosched = load_cosched_module()
+        scheduled = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="metop-3", telem="mystery")
+        err = io.StringIO()
+
+        with redirect_stderr(err):
+            args = cosched.build_mansched_args(scheduled, chain_map={"ahrpt": 7})
+
+        self.assertIn("chain={}".format(cosched.DEFAULT_CHAIN), args)
+        self.assertIn("no chain mapping for telemetry 'mystery'", err.getvalue())
+
+    def test_remote_mansched_batch_timeout_scales_with_pass_count(self):
+        # Regression: the whole remote batch shared one --timeout-secs budget, so a
+        # long schedule could time out after clearsched had already emptied the host.
+        cosched = load_cosched_module()
+        passes = [
+            make_pass(cosched, datetime(2099, 1, 1, 12, 10 * i, 0), 120, i + 1, sat="sat-{}".format(i))
+            for i in range(3)
+        ]
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            cosched.push_schedule_to_remote_mansched(passes, "remote-a")
+
+        self.assertEqual(
+            run_mock.call_args[1]["timeout"],
+            cosched.TIMEOUT_SECS + 3 * cosched.REMOTE_BATCH_SECS_PER_PASS,
+        )
+
+    def test_remote_mansched_batch_timeout_error_reports_scaled_timeout(self):
+        cosched = load_cosched_module()
+        scheduled = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="metop-3")
+        expected_timeout = cosched.TIMEOUT_SECS + cosched.REMOTE_BATCH_SECS_PER_PASS
+        run_mock = Mock(side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=expected_timeout))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            with self.assertRaises(RuntimeError) as exc:
+                cosched.push_schedule_to_remote_mansched([scheduled], "remote-a")
+
+        self.assertIn("timed out after {}s on remote-a".format(expected_timeout), str(exc.exception))
+
+    def test_remote_batch_secs_per_pass_option_sets_allowance(self):
+        cosched = load_cosched_module()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(sys, "argv", ["cosched.py", "input1.sched", "--remote-batch-secs-per-pass", "30"])
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", Mock(return_value=([[]], []))))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+
+            cosched.main()
+
+        self.assertEqual(cosched.remote_batch_timeout(2), cosched.TIMEOUT_SECS + 60)
+
 
 class CoschedDedupeTests(unittest.TestCase):
     """Verify duplicate selection keeps the intended pass and priority."""
@@ -921,6 +1316,74 @@ class CoschedDedupeTests(unittest.TestCase):
         self.assertEqual(deduped[0].idx, tied.idx)
         self.assertEqual(deduped[0].dur_s, tied.dur_s)
         self.assertEqual(deduped[0].pri, tied.pri)
+
+
+@unittest.skipIf(BASH is None, "bash is not available")
+class CoschedRemoteBatchScriptTests(unittest.TestCase):
+    """Run the generated remote mansched script in a local bash.
+
+    The TeraScan profile and mansched paths are swapped for temp stubs, so these
+    tests never touch a real TeraScan installation.
+    """
+
+    def run_batch(self, profile_body, mansched_exit):
+        """Run a two-pass batch script; return (process, list of stub mansched calls)."""
+        cosched = load_cosched_module()
+        passes = [
+            make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="first"),
+            make_pass(cosched, datetime(2099, 1, 1, 12, 30, 0), 120, 2, sat="second"),
+        ]
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+        with patch.object(cosched.subprocess, "run", run_mock):
+            cosched.push_schedule_to_remote_mansched(passes, "remote-a")
+        script = shlex.split(run_mock.call_args[0][0][-1])[-1]  # bash -lc <script>
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "tscan.bash_profile"
+            calls = Path(tmpdir) / "mansched_calls"
+            mansched = Path(tmpdir) / "mansched"
+            profile.write_text(profile_body)
+            mansched.write_text(
+                '#!/bin/sh\necho "$@" >> {}\nexit {}\n'.format(shlex.quote(calls.as_posix()), mansched_exit)
+            )
+            mansched.chmod(0o755)
+            self.assertIn("source " + PROFILE_PATH, script)
+            self.assertIn(MANSCHED_PATH, script)
+            script = script.replace("source " + PROFILE_PATH, "source " + shlex.quote(profile.as_posix()))
+            script = script.replace(MANSCHED_PATH, shlex.quote(mansched.as_posix()))
+            proc = subprocess.run(
+                [BASH, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=60,
+            )
+            call_lines = calls.read_text().splitlines() if calls.exists() else []
+        return proc, call_lines
+
+    def test_batch_stops_before_mansched_when_profile_source_fails(self):
+        # Regression: "source ... && set -e" skipped set -e when sourcing failed,
+        # then ran every mansched line anyway.
+        proc, calls = self.run_batch("return 1\n", mansched_exit=0)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("failed to source", proc.stderr)
+
+    def test_batch_stops_at_first_failing_mansched(self):
+        proc, calls = self.run_batch("# profile stub\n", mansched_exit=3)
+
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("satellite=first", calls[0])
+
+    def test_failing_command_inside_profile_does_not_abort_batch(self):
+        # set -e is enabled only after the profile is sourced, so a failing command
+        # inside an otherwise successful profile must not stop the batch.
+        proc, calls = self.run_batch("false\nexport TSCAN_STUB=1\n", mansched_exit=0)
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

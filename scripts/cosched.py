@@ -10,11 +10,15 @@ Scheduling rules:
     If more delay would be required to satisfy the gap to the previous pass, trim the
     previous pass duration (in 10-second steps) to create the gap. If even trimming the
     previous pass within the allowed trim cap cannot create the required gap without
-    exceeding the start-delay cap, the pass is skipped.
+    exceeding the start-delay cap, the pass is skipped. Only a pass that starts before
+    the new pass's latest allowed start counts as the previous pass; a pass that starts
+    later is never trimmed to make room.
 - Do not reduce any pass's duration by more than --max-trim seconds in total
     relative to its original duration (default: 180 seconds).
 - Passes whose effective duration would be reduced to 0 seconds after 10-second
     flooring/trim are treated as unscheduled and written to /tmp/cosched_not_scheduled.
+    This includes an already-scheduled previous pass that is trimmed to 0 seconds to
+    make room for a new pass.
 - When inserting a pass between two existing passes, the required trailing gap is created
     by splitting the adjustment between trimming the new pass's stop time and delaying the
     first following pass's start, so neither pass bears the full cost. The first following
@@ -22,7 +26,7 @@ Scheduling rules:
     trimmed for the remainder. If the cascade from delaying the first following pass
     exceeds any later pass's start-delay budget, the algorithm falls back to cascade-
     delaying all following passes without trimming the new pass.
-- Passes whose original start time is in the past are skipped.
+- Passes whose original start time is in the past (by the host's local clock) are skipped.
 - Assignment is greedy: passes are processed in priority order (lower number = higher
     priority), then by start time within each priority level. Each pass is placed on the
     channel that allows the earliest adjusted start via greedy append; ties resolved by
@@ -33,6 +37,8 @@ Scheduling rules:
 Input format (space-separated, header lines start with '#'):
 #  state  pri  satel    telem       date    day    time    durat  post_process
  1  sched   3  metop-3   ahrpt    2025/08/18 230  19:08:50  12:50
+
+The post_process column is ignored, and lines that do not match this layout are skipped.
 
 Assumptions:
 - Duplicate passes are identified by (satellite, telemetry) with start times within 30 seconds
@@ -45,6 +51,7 @@ Usage (file mode):
         [--gap 190] [--max-trim 180] [--max-start-delay 180] \
         [--timeout-secs 120] [--ssh-connect-timeout 30] \
         [--ssh-keepalive-interval 30] [--ssh-keepalive-count-max 3] \
+        [--remote-batch-secs-per-pass 10] \
         [--remote-host user@host] [--remote-host user@host2] ... \
         [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ... \
         [--sat-priority SAT=PRIORITY] ...
@@ -62,14 +69,16 @@ even if earlier fetch failures change the surviving channel order.
 Satellite priority overrides:
 - --sat-priority SAT=PRIORITY  Override the scheduled priority for a satellite across all
     channels (repeat for multiple; case-insensitive). Applied after scheduling, before
-    writing output files and submitting to mansched. Takes precedence over priorities in
-    the input schedule.
+    writing output files and submitting to mansched, so it does not change which passes
+    are scheduled or on which channel; it only sets the priority recorded in the outputs
+    and passed to mansched. Unscheduled passes keep their input priority.
 
 Usage (fetch mode):
     cosched.py --fetch [--remote-host user@host] [--remote-host user@host2] ...
 
 In fetch mode, listsched is run locally and on each --remote-host. The results are written
-to /tmp/<hostname>.sched and then used as the channel inputs automatically. The number of
+to /tmp/local_<hostname>.sched and /tmp/remote_<host>.sched and then used as the channel
+inputs automatically. The number of
 channels equals the number of successfully fetched schedules that contain at least one
 pass entry. Fetches that return only the header are treated as failures.
 By default, /opt/terascan/bin/resched is run before listsched during each fetch.
@@ -77,6 +86,9 @@ Use --no-resched to skip that pre-step.
 
 In both modes:
 - Outputs default to sibling files next to the first input: cosched_out_1 ... cosched_out_N.
+- In fetch mode, --out values and default output names follow the source each channel
+    was fetched from (first --out / cosched_out_1 = local, then one per --remote-host in
+    order), so a failed fetch never shifts another source's output onto the wrong path.
 - In file mode, channel 1 is pushed locally via clearsched + mansched.
 - In file mode, each additional channel maps to the corresponding --remote-host (in order)
     and is pushed over SSH. If more channels than --remote-host entries, the extra channels
@@ -84,6 +96,10 @@ In both modes:
 - In fetch mode, each successfully fetched channel is pushed back to the source it was
     fetched from, so partial fetch failures do not remap remote channels onto the wrong
     targets.
+- Telemetry is mapped to chain numbers per station: the local channel uses the local
+    system.config, and each remote channel uses that remote host's own system.config,
+    read over SSH before any schedule is changed. If a remote host cannot be reached at
+    that point, the run aborts without clearing any station.
 - clearsched/mansched failures abort the run immediately so later channels are not
     modified after a failed push step.
 - Passes that could not be placed on any channel (past passes, or passes blocked by gap/trim
@@ -91,12 +107,15 @@ In both modes:
     written to /tmp/cosched_not_scheduled in the same
   schedule file format.
 - Remote mansched submissions are batched per host into a single SSH session to reduce
-    connection overhead and timeout risk.
+    connection overhead and timeout risk. The batch stops before any mansched runs if
+    the TeraScan profile cannot be sourced, and stops at the first failing mansched.
 
 All subprocess calls (clearsched, mansched, listsched, remote SSH) use
---timeout-secs (default: 120). SSH connection and keepalive behavior are configurable
-with --ssh-connect-timeout, --ssh-keepalive-interval, and
---ssh-keepalive-count-max. Remote commands source
+--timeout-secs (default: 120), except a remote mansched batch: because all of a host's
+mansched calls share one SSH session, it gets --timeout-secs plus
+--remote-batch-secs-per-pass (default: 10) for each pass in the batch. SSH connection
+and keepalive behavior are configurable with --ssh-connect-timeout,
+--ssh-keepalive-interval, and --ssh-keepalive-count-max. Remote commands source
 /opt/terascan/etc/tscan.bash_profile before executing.
 
 Compatible with Python 3.6+ (RHEL 7).
@@ -124,6 +143,7 @@ from typing import List, Dict, Optional, Set, Tuple
 
 HEADER = "#  state  pri  satel    telem       date    day    time    durat  post_process"
 TIMEOUT_SECS = 120  # per subprocess call
+REMOTE_BATCH_SECS_PER_PASS = 10  # extra timeout per pass for a remote mansched batch
 SSH_CONNECT_TIMEOUT = 30
 SSH_SERVER_ALIVE_INTERVAL = 30
 SSH_SERVER_ALIVE_COUNT_MAX = 3
@@ -142,6 +162,22 @@ _FALLBACK_CHAIN_MAP = {
     "ahrpt": 5,
     "rtd": 6,
 }
+
+
+def _chain_map_from_config(cfg):
+    # type: (configparser.RawConfigParser) -> Dict[str, int]
+    """Return the telemetry-name -> chain-number entries found in a parsed system.config."""
+    result = {}  # type: Dict[str, int]
+    for section in cfg.sections():
+        try:
+            chain = int(section)
+        except ValueError:
+            continue  # skip non-numeric sections (e.g. [antenna-1], [system])
+        if cfg.has_option(section, "telemetry.name"):
+            telem = cfg.get(section, "telemetry.name").strip().lower()
+            if telem:
+                result[telem] = chain
+    return result
 
 
 def load_telemetry_chain_map(path=SYSTEM_CONFIG, default=None):
@@ -166,16 +202,7 @@ def load_telemetry_chain_map(path=SYSTEM_CONFIG, default=None):
     try:
         cfg = configparser.RawConfigParser()
         cfg.read(path)
-        result = {}  # type: Dict[str, int]
-        for section in cfg.sections():
-            try:
-                chain = int(section)
-            except ValueError:
-                continue  # skip non-numeric sections (e.g. [antenna-1], [system])
-            if cfg.has_option(section, "telemetry.name"):
-                telem = cfg.get(section, "telemetry.name").strip().lower()
-                if telem:
-                    result[telem] = chain
+        result = _chain_map_from_config(cfg)
         return result if result else default
     except Exception as exc:
         print("WARNING: could not load telemetry chain map from {}: {}".format(path, exc),
@@ -539,6 +566,8 @@ def _find_insertion(
                 if latest_start is None:
                     continue
                 adj_start = latest_start
+                if p_prev_start >= adj_start:
+                    continue  # p_prev is not a predecessor of p; never trim it
                 target_prev_end = adj_start - timedelta(seconds=gap_seconds)
                 target_prev_dur_raw = int((target_prev_end - p_prev_start).total_seconds())
                 target_prev_dur = max(0, floor_to_10s_seconds(target_prev_dur_raw))
@@ -723,6 +752,11 @@ def schedule_n_channels(
                 if latest_start is None:
                     continue
                 adj_start = latest_start
+                if prev_start >= adj_start:
+                    # prev starts after p's latest allowed start, so it is not a
+                    # predecessor; trimming it would evict an unrelated pass.
+                    # Leave p to the insertion fallback.
+                    continue
 
                 target_prev_end = adj_start - timedelta(seconds=gap_seconds)
                 target_prev_dur_raw = int((target_prev_end - prev_start).total_seconds())
@@ -894,6 +928,25 @@ def clear_tschedule() -> None:
     print("Cleared terascan schedule")
 
 
+def ssh_command(host: str, remote_cmd: str) -> List[str]:
+    """Return the ssh argv used for every remote call (batch mode, timeouts, keepalives)."""
+    return [
+        "ssh",
+        "-n",
+        "-q",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
+        "-o",
+        "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
+        "-o",
+        "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
+        host,
+        remote_cmd,
+    ]
+
+
 def clear_remote_tschedule(host: Optional[str] = None) -> None:
     """Purge terascan schedule on a remote host via ssh.
 
@@ -906,21 +959,7 @@ def clear_remote_tschedule(host: Optional[str] = None) -> None:
         remote_cmd = "bash -lc " + shlex.quote(
             "source /opt/terascan/etc/tscan.bash_profile && " + shlex.quote(cmd)
         )
-        ssh_args = [
-            "ssh",
-            "-n",
-            "-q",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
-            "-o",
-            "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
-            "-o",
-            "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
-            host,
-            remote_cmd,
-        ]
+        ssh_args = ssh_command(host, remote_cmd)
         print("Running:", " ".join(ssh_args))
         result = subprocess.run(
             ssh_args,
@@ -947,14 +986,82 @@ def clear_remote_tschedule(host: Optional[str] = None) -> None:
     print("Cleared remote terascan schedule")
 
 
-def telemetry_to_chain(telem: str) -> int:
-    """Map telemetry to a TeraScan chain number."""
+def telemetry_to_chain(telem: str, chain_map: Optional[Dict[str, int]] = None) -> int:
+    """Map telemetry to a TeraScan chain number using chain_map (default: the local map).
+
+    Unknown telemetry falls back to DEFAULT_CHAIN and prints a warning to stderr.
+    """
+    if chain_map is None:
+        chain_map = TELEMETRY_CHAIN_MAP
     key = (telem or "").strip().lower()
-    return TELEMETRY_CHAIN_MAP.get(key, DEFAULT_CHAIN)
+    if key not in chain_map:
+        print(
+            "WARNING: no chain mapping for telemetry {!r}; using chain {}".format(telem, DEFAULT_CHAIN),
+            file=sys.stderr,
+        )
+        return DEFAULT_CHAIN
+    return chain_map[key]
 
 
-def build_mansched_args(p: Pass, overrides: Optional[Dict[str, str]] = None) -> List[str]:
-    """Build mansched k=v args with defaults from pass data, allowing overrides."""
+def fetch_remote_telemetry_chain_map(host, default=None):
+    # type: (str, Optional[Dict[str, int]]) -> Dict[str, int]
+    """Read SYSTEM_CONFIG on a remote host over SSH and return its chain map.
+
+    Remote stations may number their chains differently from the local host, so
+    remote mansched submissions must use the remote station's own mapping. Falls
+    back to *default* (the built-in map) when the remote file is missing,
+    unparseable, or has no usable entries, mirroring load_telemetry_chain_map.
+
+    Raises:
+        RuntimeError: If ssh is not on PATH, the call times out, or SSH fails.
+    """
+    if default is None:
+        default = _FALLBACK_CHAIN_MAP
+    remote_cmd = "bash -c " + shlex.quote(
+        "if [ -r {path} ]; then cat {path}; fi".format(path=shlex.quote(SYSTEM_CONFIG))
+    )
+    try:
+        proc = subprocess.run(
+            ssh_command(host, remote_cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=TIMEOUT_SECS,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("ssh not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("ssh to {} timed out after {}s".format(host, TIMEOUT_SECS))
+    if proc.returncode != 0:
+        raise RuntimeError("ssh to {} failed (exit {}): {}".format(host, proc.returncode, proc.stderr.strip()))
+
+    try:
+        cfg = configparser.RawConfigParser()
+        cfg.read_string(proc.stdout)
+        result = _chain_map_from_config(cfg)
+    except configparser.Error as exc:
+        print("WARNING: could not parse {} on {}: {}".format(SYSTEM_CONFIG, host, exc), file=sys.stderr)
+        return default
+    if not result:
+        print(
+            "WARNING: no telemetry chain map in {} on {}; using built-in defaults".format(SYSTEM_CONFIG, host),
+            file=sys.stderr,
+        )
+        return default
+    return result
+
+
+def build_mansched_args(
+    p: Pass,
+    overrides: Optional[Dict[str, str]] = None,
+    chain_map: Optional[Dict[str, int]] = None,
+) -> List[str]:
+    """Build mansched k=v args with defaults from pass data, allowing overrides.
+
+    chain_map is the telemetry -> chain mapping of the station the pass is loaded
+    on; it defaults to the local station's map.
+    """
     overrides = overrides or {}
     start_dt = p.out_start or p.start
     dur_s = p.out_dur_s if p.out_dur_s is not None else p.dur_s
@@ -963,7 +1070,7 @@ def build_mansched_args(p: Pass, overrides: Optional[Dict[str, str]] = None) -> 
     satellite = overrides.get("satellite", p.sat)
     chain = overrides.get("chain")
     if chain is None:
-        chain = telemetry_to_chain(telemetry)
+        chain = telemetry_to_chain(telemetry, chain_map)
     # Ensure chain is str for command assembly
     chain_str = str(chain)
 
@@ -1026,8 +1133,27 @@ def push_schedule_to_mansched(passes: List[Pass], overrides: Optional[Dict[str, 
             )
 
 
-def push_schedule_to_remote_mansched(passes: List[Pass], host: str, overrides: Optional[Dict[str, str]] = None) -> None:
+def remote_batch_timeout(n_passes: int) -> int:
+    """Return the timeout for a remote mansched batch of n_passes.
+
+    The whole batch runs in one SSH session, so a single --timeout-secs budget
+    would be shared by every mansched call and a long schedule could time out
+    after clearsched had already emptied the host. The batch gets the base
+    timeout plus REMOTE_BATCH_SECS_PER_PASS for each pass instead.
+    """
+    return TIMEOUT_SECS + n_passes * REMOTE_BATCH_SECS_PER_PASS
+
+
+def push_schedule_to_remote_mansched(
+    passes: List[Pass],
+    host: str,
+    overrides: Optional[Dict[str, str]] = None,
+    chain_map: Optional[Dict[str, int]] = None,
+) -> None:
     """Invoke mansched over ssh on the given host once per pass using defaults/overrides.
+
+    chain_map should be the remote host's own telemetry -> chain mapping (see
+    fetch_remote_telemetry_chain_map); it defaults to the local map.
 
     Raises RuntimeError if the remote batch cannot be executed successfully.
     """
@@ -1043,40 +1169,38 @@ def push_schedule_to_remote_mansched(passes: List[Pass], host: str, overrides: O
             dur_s = p.out_dur_s if p.out_dur_s is not None else p.dur_s
             if dur_s <= 0:
                 continue  # skip zero-length passes
-            tokens = [cmd] + build_mansched_args(p, overrides)
+            tokens = [cmd] + build_mansched_args(p, overrides, chain_map)
             remote_lines.append(" ".join(shlex.quote(t) for t in tokens))
 
         if not remote_lines:
             print("No remote passes to schedule; skipping remote mansched.")
             return
 
-        remote_script = "source /opt/terascan/etc/tscan.bash_profile && set -e\n" + "\n".join(remote_lines)
+        # Stop before any mansched runs if the profile cannot be sourced, then enable
+        # errexit so the batch stops at the first failing mansched. set -e comes after
+        # the source so it does not apply to commands inside the TeraScan profile.
+        remote_script = (
+            "source /opt/terascan/etc/tscan.bash_profile || "
+            "{ echo 'failed to source /opt/terascan/etc/tscan.bash_profile' >&2; exit 1; }\n"
+            "set -e\n"
+        ) + "\n".join(remote_lines)
         remote_cmd = "bash -lc " + shlex.quote(remote_script)
-        ssh_args = [
-            "ssh",
-            "-n",
-            "-q",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
-            "-o",
-            "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
-            "-o",
-            "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
-            host,
-            remote_cmd,
-        ]
-        print("Running remote mansched batch for {} pass(es) on {}".format(len(remote_lines), host))
+        ssh_args = ssh_command(host, remote_cmd)
+        batch_timeout = remote_batch_timeout(len(remote_lines))
+        print(
+            "Running remote mansched batch for {} pass(es) on {} (timeout {}s)".format(
+                len(remote_lines), host, batch_timeout
+            )
+        )
         result = subprocess.run(
             ssh_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            timeout=TIMEOUT_SECS,
+            timeout=batch_timeout,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("remote mansched timed out after {}s on {}".format(TIMEOUT_SECS, host))
+        raise RuntimeError("remote mansched timed out after {}s on {}".format(batch_timeout, host))
     except Exception as e:
         raise RuntimeError("Error running remote mansched: {}".format(e))
 
@@ -1183,21 +1307,7 @@ def fetch_remote_schedule(host: str) -> str:
     remote_cmd = "bash -lc " + shlex.quote(remote_inner)
     try:
         proc = subprocess.run(
-            [
-                "ssh",
-                "-n",
-                "-q",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout={}".format(SSH_CONNECT_TIMEOUT),
-                "-o",
-                "ServerAliveInterval={}".format(SSH_SERVER_ALIVE_INTERVAL),
-                "-o",
-                "ServerAliveCountMax={}".format(SSH_SERVER_ALIVE_COUNT_MAX),
-                host,
-                remote_cmd,
-            ],
+            ssh_command(host, remote_cmd),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
@@ -1240,7 +1350,7 @@ def write_raw_schedule(label: str, content: str) -> str:
 
 def main():
     global TIMEOUT_SECS, SSH_CONNECT_TIMEOUT, SSH_SERVER_ALIVE_INTERVAL, SSH_SERVER_ALIVE_COUNT_MAX
-    global RUN_RESCHED_BEFORE_LISTSCHED
+    global RUN_RESCHED_BEFORE_LISTSCHED, REMOTE_BATCH_SECS_PER_PASS
     ap = argparse.ArgumentParser(
         description=(
             "Co-schedule satellite pass lists into one or more gap-constrained schedules. "
@@ -1261,8 +1371,8 @@ def main():
         default=False,
         help=(
             "Fetch schedules by running resched + listsched locally and on each --remote-host, "
-            "write them to {}/".format(SCHED_DIR) + "<hostname>.sched, "
-            "then use those files as inputs."
+            "write them to {0}/local_<hostname>.sched and {0}/remote_<host>.sched, "
+            "then use those files as inputs.".format(SCHED_DIR)
         ),
     )
     ap.add_argument(
@@ -1277,22 +1387,46 @@ def main():
         action="append",
         default=[],
         metavar="PATH",
-        help="Output path for each channel (repeat for each channel; defaults to cosched_out_N next to the first input)",
+        help=(
+            "Output path for each channel (repeat for each channel; defaults to cosched_out_N next to the "
+            "first input). In fetch mode the first --out is the local schedule and each further --out "
+            "matches a --remote-host in order, even if some fetches fail."
+        ),
     )
     ap.add_argument("--gap", type=int, default=190, help="Minimum gap in seconds between passes on a channel (default: 190)")
     ap.add_argument("--max-trim", type=int, default=180, help="Maximum total duration reduction allowed per pass in seconds (default: 180)")
     ap.add_argument("--max-start-delay", type=int, default=180, help="Maximum start delay allowed for a pass in seconds (default: 180)")
-    ap.add_argument("--timeout-secs", type=int, default=TIMEOUT_SECS, help="Subprocess timeout in seconds for clearsched/mansched/listsched/ssh calls (default: 120)")
+    ap.add_argument(
+        "--timeout-secs",
+        type=int,
+        default=TIMEOUT_SECS,
+        help=(
+            "Subprocess timeout in seconds for clearsched/mansched/listsched/ssh calls (default: 120). "
+            "A remote mansched batch also gets --remote-batch-secs-per-pass for each pass."
+        ),
+    )
     ap.add_argument("--ssh-connect-timeout", type=int, default=SSH_CONNECT_TIMEOUT, help="SSH connection timeout in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-interval", type=int, default=SSH_SERVER_ALIVE_INTERVAL, help="SSH ServerAliveInterval in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-count-max", type=int, default=SSH_SERVER_ALIVE_COUNT_MAX, help="SSH ServerAliveCountMax (default: 3)")
+    ap.add_argument(
+        "--remote-batch-secs-per-pass",
+        type=int,
+        default=REMOTE_BATCH_SECS_PER_PASS,
+        help=(
+            "Extra timeout in seconds per pass for each remote mansched batch, added to --timeout-secs "
+            "(default: {})".format(REMOTE_BATCH_SECS_PER_PASS)
+        ),
+    )
     ap.add_argument(
         "--remote-host",
         dest="remote_hosts",
         action="append",
         default=[],
         metavar="HOST",
-        help="Remote host for channel 2, 3, ... (repeat for each additional channel; e.g. user@host)",
+        help=(
+            "Remote station as an SSH target, e.g. user@host (repeat for each station). File mode: push "
+            "target for channel 2, 3, ... in order. Fetch mode: also a schedule source."
+        ),
     )
     ap.add_argument(
         "--exclude-sat",
@@ -1327,7 +1461,8 @@ def main():
         help=(
             "Override the priority for a specific satellite (e.g. metop-3=2). "
             "Repeat for multiple satellites. Case-insensitive. "
-            "Applies to all channels and takes precedence over priorities in the input schedule."
+            "Applied to all channels after scheduling: it sets the priority written to the output "
+            "files and passed to mansched, but does not change which passes are scheduled."
         ),
     )
     args = ap.parse_args()
@@ -1357,11 +1492,14 @@ def main():
         ap.error("--ssh-keepalive-interval must be > 0")
     if args.ssh_keepalive_count_max <= 0:
         ap.error("--ssh-keepalive-count-max must be > 0")
+    if args.remote_batch_secs_per_pass < 0:
+        ap.error("--remote-batch-secs-per-pass must be >= 0")
 
     TIMEOUT_SECS = args.timeout_secs
     SSH_CONNECT_TIMEOUT = args.ssh_connect_timeout
     SSH_SERVER_ALIVE_INTERVAL = args.ssh_keepalive_interval
     SSH_SERVER_ALIVE_COUNT_MAX = args.ssh_keepalive_count_max
+    REMOTE_BATCH_SECS_PER_PASS = args.remote_batch_secs_per_pass
     RUN_RESCHED_BEFORE_LISTSCHED = not args.no_resched
 
     if args.fetch:
@@ -1369,6 +1507,8 @@ def main():
         # output to SCHED_DIR, then use those paths as inputs for scheduling.
         input_paths = []             # type: List[str]
         channel_targets = []         # type: List[Tuple[str, Optional[str]]]
+        channel_slots = []           # type: List[int]  # 0 = local, k = --remote-host #k
+        n_slots = 1 + len(args.remote_hosts)
         used_labels = set()          # type: Set[str]
         failures = 0
 
@@ -1385,12 +1525,13 @@ def main():
             print(f"Fetched local schedule to {path}")
             input_paths.append(path)
             channel_targets.append(("local", None))
+            channel_slots.append(0)
         except Exception as e:
             print(f"ERROR fetching local schedule: {e}", file=sys.stderr)
             failures += 1
 
         # Remotes
-        for host in args.remote_hosts:
+        for slot, host in enumerate(args.remote_hosts, start=1):
             label = ensure_unique_label(
                 "remote_{}".format(sanitize_label(host)),
                 used_labels,
@@ -1403,6 +1544,7 @@ def main():
                 print(f"Fetched remote schedule from {host} to {path}")
                 input_paths.append(path)
                 channel_targets.append(("remote", host))
+                channel_slots.append(slot)
             except Exception as e:
                 print(f"ERROR fetching schedule from {host}: {e}", file=sys.stderr)
                 failures += 1
@@ -1424,6 +1566,8 @@ def main():
                 channel_targets.append(("remote", args.remote_hosts[host_idx]))
             else:
                 channel_targets.append(("unmapped", None))
+        channel_slots = list(range(len(input_paths)))
+        n_slots = len(input_paths)
 
     n_channels = len(input_paths)
 
@@ -1480,9 +1624,12 @@ def main():
                 if override is not None:
                     p.pri = override
 
-    # Resolve output paths (use supplied --out values, fall back to defaults)
-    defaults = default_output_paths(input_paths[0], n_channels)
-    out_paths = [args.outputs[i] if i < len(args.outputs) else defaults[i] for i in range(n_channels)]
+    # Resolve output paths (use supplied --out values, fall back to defaults).
+    # Both follow each channel's source slot (in fetch mode: local first, then
+    # --remote-host order), so a failed fetch never shifts another source's
+    # output onto the wrong path.
+    defaults = default_output_paths(input_paths[0], n_slots)
+    out_paths = [args.outputs[s] if s < len(args.outputs) else defaults[s] for s in channel_slots]
 
     # Write output files
     for i, (ch, path) in enumerate(zip(channels, out_paths), start=1):
@@ -1493,6 +1640,22 @@ def main():
     not_sched_path = "/tmp/cosched_not_scheduled"
     write_schedule(not_sched_path, unscheduled)
     print(f"Wrote {len(unscheduled)} unscheduled passes to {not_sched_path}")
+
+    # Read each remote target's own telemetry -> chain map before modifying any
+    # station, so remote passes are loaded on the remote's chain numbers and an
+    # unreachable remote aborts the run before anything is cleared.
+    remote_chain_maps = {}  # type: Dict[str, Dict[str, int]]
+    for target_kind, target_host in channel_targets:
+        if target_kind != "remote" or target_host is None or target_host in remote_chain_maps:
+            continue
+        try:
+            remote_chain_maps[target_host] = fetch_remote_telemetry_chain_map(target_host)
+        except RuntimeError as exc:
+            print(
+                "ERROR reading telemetry chain map from {}: {}; no schedules were changed.".format(target_host, exc),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Push each channel back to its configured target.
     for i, ch in enumerate(channels, start=1):
@@ -1505,7 +1668,7 @@ def main():
                 if target_host is None:
                     raise RuntimeError("No remote host configured for channel {}".format(i))
                 clear_remote_tschedule(target_host)
-                push_schedule_to_remote_mansched(ch, target_host)
+                push_schedule_to_remote_mansched(ch, target_host, chain_map=remote_chain_maps[target_host])
             else:
                 print(f"No push target configured for channel {i}; skipping push.")
         except RuntimeError as exc:

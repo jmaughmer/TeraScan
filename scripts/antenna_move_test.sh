@@ -30,8 +30,16 @@ EL_STEP="$DEFAULT_EL_STEP"
 POSITION_TIMEOUT="$DEFAULT_POSITION_TIMEOUT"
 CSV_OUTPUT="$DEFAULT_CSV_OUTPUT"
 
+# Set to 1 once stdout/stderr are redirected to the log file (see Logging).
+LOG_REDIRECTED=0
+
 die() {
   echo "ERROR: $*" >&2
+  # After the logging redirect, stderr only reaches the log file; also write
+  # to fd 4 (the terminal's original stderr) so the operator sees the error.
+  if (( LOG_REDIRECTED )); then
+    echo "ERROR: $*" >&4
+  fi
   exit 1
 }
 
@@ -106,14 +114,15 @@ while [[ $# -gt 0 ]]; do
       echo "  -c, --telemetry-chain  Telemetry chain (default: $DEFAULT_TELEMETRY_CHAIN)"
       echo "  -o, --csv-output       CSV output file (default: $DEFAULT_CSV_OUTPUT)"
       echo "  -t, --telemetry-data   Telemetry data (default: $DEFAULT_TELEMETRY_DATA)"
-      echo "      --az-start         Azimuth start (default: $DEFAULT_AZ_START)"
-      echo "      --az-end           Azimuth end (default: $DEFAULT_AZ_END)"
-      echo "      --az-step          Azimuth step (default: $DEFAULT_AZ_STEP)"
-      echo "      --el-start         Elevation start (default: $DEFAULT_EL_START)"
-      echo "      --el-end           Elevation end (default: $DEFAULT_EL_END)"
-      echo "      --el-step          Elevation step (default: $DEFAULT_EL_STEP)"
-      echo "      --position-timeout Position timeout in seconds (default: $DEFAULT_POSITION_TIMEOUT)"
+      echo "      --az-start         Azimuth start, 0-3600 (default: $DEFAULT_AZ_START)"
+      echo "      --az-end           Azimuth end, 0-3600 (default: $DEFAULT_AZ_END)"
+      echo "      --az-step          Azimuth step, > 0 (default: $DEFAULT_AZ_STEP)"
+      echo "      --el-start         Elevation start, 0-900 (default: $DEFAULT_EL_START)"
+      echo "      --el-end           Elevation end, 0-900 (default: $DEFAULT_EL_END)"
+      echo "      --el-step          Elevation step, > 0 if start != end (default: $DEFAULT_EL_STEP)"
+      echo "      --position-timeout Seconds to wait for each position (default: $DEFAULT_POSITION_TIMEOUT)"
       echo "  -h, --help             Show this help message"
+      echo "Azimuth and elevation values are in tenths of a degree (900 = 90.0 degrees)."
       exit 0
       ;;
     *)
@@ -128,8 +137,10 @@ mkdir -p "${HOME}/logs"
 LOG="antenna_move_test-${STAMP}.log"
 MAINLOG="${HOME}/logs/${LOG}"
 
-# send all output to the console and log file
-exec 3>&1 1>>"$MAINLOG" 2>&1
+# send all output to the log file; fd 3 and fd 4 keep the terminal's
+# stdout and stderr for f_log and die
+exec 3>&1 4>&2 1>>"$MAINLOG" 2>&1
+LOG_REDIRECTED=1
 
 # logging function
 f_log () {
