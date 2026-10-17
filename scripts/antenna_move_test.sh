@@ -30,8 +30,16 @@ EL_STEP="$DEFAULT_EL_STEP"
 POSITION_TIMEOUT="$DEFAULT_POSITION_TIMEOUT"
 CSV_OUTPUT="$DEFAULT_CSV_OUTPUT"
 
+# Set to 1 once stdout/stderr are redirected to the log file (see Logging).
+LOG_REDIRECTED=0
+
 die() {
   echo "ERROR: $*" >&2
+  # After the logging redirect, stderr only reaches the log file; also write
+  # to fd 4 (the terminal's original stderr) so the operator sees the error.
+  if (( LOG_REDIRECTED )); then
+    echo "ERROR: $*" >&4
+  fi
   exit 1
 }
 
@@ -128,8 +136,10 @@ mkdir -p "${HOME}/logs"
 LOG="antenna_move_test-${STAMP}.log"
 MAINLOG="${HOME}/logs/${LOG}"
 
-# send all output to the console and log file
-exec 3>&1 1>>"$MAINLOG" 2>&1
+# send all output to the log file; fd 3 and fd 4 keep the terminal's
+# stdout and stderr for f_log and die
+exec 3>&1 4>&2 1>>"$MAINLOG" 2>&1
+LOG_REDIRECTED=1
 
 # logging function
 f_log () {

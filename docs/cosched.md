@@ -15,7 +15,7 @@ Remote scheduling is submitted in a single SSH batch per remote channel to reduc
 | `listsched` | TeraScan binary – reads the current pass schedule (fetch mode only) |
 | `clearsched` | TeraScan binary – clears the existing schedule before loading a new one |
 | `mansched` | TeraScan binary – loads individual passes into TeraScan |
-| `ssh` | OpenSSH client – used when pushing to remote channels |
+| `ssh` | OpenSSH client – used to fetch from, read `system.config` on, and push to remote hosts |
 
 All TeraScan binaries are expected at `/opt/terascan/bin/`. Remote SSH commands source `/opt/terascan/etc/tscan.bash_profile` before executing.
 
@@ -49,13 +49,15 @@ before being used as an input. If labels would collide, a numeric suffix is appe
 them unique.
 Use `--no-resched` to skip running `resched` before `listsched`.
 
+Output paths in fetch mode follow the source each channel came from, not the channel's position after failed fetches are dropped: the first `--out` (or default `cosched_out_1`) is always the local schedule, and each further `--out` (or `cosched_out_2`, `cosched_out_3`, …) matches a `--remote-host` in the order given. For example, with one `--remote-host`, if the local fetch fails, the remote schedule is still written to the second `--out` path (or `cosched_out_2`), never to the local one.
+
 ## Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--fetch` | off | Fetch schedules via `listsched` instead of reading files |
 | `--no-resched` | off | In fetch mode, skip running `resched` before `listsched` |
-| `--out <path>` | `cosched_out_N` next to first input | Output path for channel N (repeat once per channel) |
+| `--out <path>` | `cosched_out_N` next to first input | Output path for channel N (repeat once per channel). In fetch mode, the first is the local schedule and each further one matches a `--remote-host` in order, even if some fetches fail |
 | `--gap <int>` | `190` | Minimum gap in seconds between consecutive passes on a channel |
 | `--max-trim <int>` | `180` | Maximum total duration reduction (seconds) allowed per pass |
 | `--max-start-delay <int>` | `180` | Maximum start delay (seconds) allowed when pushing a pass later |
@@ -131,8 +133,10 @@ Passes are assigned to channels using a **priority-first, earliest-start** greed
    - If the required gap is already satisfied, the pass start is used as-is (ceiled to 10 s).
    - If the gap is short by ≤ `--max-start-delay`, the pass start is pushed forward.
    - Otherwise, the previous pass's duration is trimmed (in 10-second steps) to create the gap. If trimming would exceed `--max-trim`, that channel is skipped.
+   - Only a pass that starts before the new pass's latest allowed start (original start + `--max-start-delay`) counts as the previous pass. If the channel's last pass starts later than that, it is never trimmed; the new pass is left to the insertion fallback in step 5.
+   - If trimming reduces the previous pass to zero seconds, that already-scheduled pass is removed from the channel and written to `/tmp/cosched_not_scheduled`.
 4. The channel that yields the **earliest adjusted start** is chosen; ties are broken by longest adjusted duration, then lowest channel index.
-5. If no channel can accept the pass via append, an **insertion fallback** is attempted: every position within every channel is tested, optionally trimming the preceding pass to create the required leading gap, and splitting the trailing-gap adjustment between trimming the new pass's stop time and delaying the first following pass's start, so neither pass bears the full cost. The first following pass absorbs as much of the shortfall as its remaining start-delay budget allows; the new pass is trimmed for the remainder. If cascading the first following pass's delay into later passes would exceed any later pass's start-delay budget, the algorithm falls back to cascade-delaying all following passes without trimming the new pass. If all channels reject all insertion positions, the pass is unscheduled. Insertion positions that require **no changes to already-scheduled passes** are preferred over those that modify surrounding passes; within each group the earliest adjusted start wins, then longest duration.
+5. If no channel can accept the pass via append, an **insertion fallback** is attempted: every position within every channel is tested, optionally trimming the preceding pass to create the required leading gap (again, only if it starts before the new pass's latest allowed start), and splitting the trailing-gap adjustment between trimming the new pass's stop time and delaying the first following pass's start, so neither pass bears the full cost. The first following pass absorbs as much of the shortfall as its remaining start-delay budget allows; the new pass is trimmed for the remainder. If cascading the first following pass's delay into later passes would exceed any later pass's start-delay budget, the algorithm falls back to cascade-delaying all following passes without trimming the new pass. If all channels reject all insertion positions, the pass is unscheduled. Insertion positions that require **no changes to already-scheduled passes** are preferred over those that modify surrounding passes; within each group the earliest adjusted start wins, then longest duration.
 6. If no insertion position is feasible on any channel, or if a pass would be reduced to zero duration after 10-second flooring/trim, the pass is written to `/tmp/cosched_not_scheduled`.
 7. Start times are rounded up to the nearest 10-second boundary; durations are rounded down to the nearest 10-second boundary.
 
@@ -160,11 +164,14 @@ Each successfully fetched schedule keeps the push target it came from.
 
 ## Telemetry-to-chain mapping
 
-Telemetry chain mapping is loaded from `/opt/terascan/pass/config/system.config` when available.
+Telemetry chain mapping is loaded from `/opt/terascan/pass/config/system.config`, separately for each station:
 
+- The local channel uses the local `system.config`.
+- Each remote channel uses that remote host's own `system.config`, read over SSH before any schedule is changed. Stations can number their chains differently, so a remote host's passes are never loaded with the local station's chain numbers.
+- If a remote host cannot be reached while its `system.config` is being read, the run aborts before any station (local or remote) is cleared.
 - Numeric section names (for example `[1]`, `[2]`, ...) are treated as chain IDs.
 - `telemetry.name` values in those sections are mapped (case-insensitive) to chain IDs.
-- If no usable mapping is found, `cosched.py` falls back to the built-in defaults below.
+- If a station's `system.config` is missing or has no usable mapping, `cosched.py` falls back to the built-in defaults below for that station.
 
 | Telemetry | Chain |
 |-----------|-------|
@@ -175,7 +182,7 @@ Telemetry chain mapping is loaded from `/opt/terascan/pass/config/system.config`
 | `ahrpt` | 5 |
 | `rtd` | 6 |
 
-Unrecognized telemetry strings default to chain 1.
+Unrecognized telemetry strings default to chain 1, and a warning naming the telemetry is printed to stderr.
 
 ## Output file format
 
@@ -195,7 +202,10 @@ After each run, passes that were not placed on any channel are written to `/tmp/
 
 - Its original start time is already in the past, **or**
 - Every channel rejects both the append attempt and all insertion positions because the required start delay would exceed `--max-start-delay` and/or trimming surrounding passes on every channel would exceed `--max-trim`, **or**
-- Its effective duration would be reduced to zero after 10-second flooring or trimming. In that case, the unscheduled output preserves the original requested start time and duration.
+- Its effective duration would be reduced to zero after 10-second flooring or trimming, **or**
+- It had already been placed, but was then trimmed to zero seconds as the previous pass of a later-processed pass.
+
+In the last two cases, the unscheduled output preserves the original requested start time and duration.
 
 ## Examples
 
@@ -254,6 +264,8 @@ python3 cosched.py --fetch \
   --out /opt/schedules/remote.sched
 ```
 
+`local.sched` always receives the local schedule and `remote.sched` the schedule for `ops@remote-gs`. If the local fetch fails, nothing is written to `local.sched`; the remote schedule still goes to `remote.sched`.
+
 ### Exclude satellites from specific channels
 
 ```bash
@@ -282,7 +294,7 @@ python3 cosched.py --fetch \
 
 ## Subprocess timeouts
 
-All calls to `listsched`, `clearsched`, `mansched`, and remote SSH commands use `--timeout-secs` (default: 120).
+All calls to `listsched`, `clearsched`, `mansched`, and remote SSH commands (including reading each remote `system.config`) use `--timeout-secs` (default: 120).
 
 SSH behavior is additionally controlled by:
 
@@ -290,4 +302,4 @@ SSH behavior is additionally controlled by:
 - `--ssh-keepalive-interval` (default: 30)
 - `--ssh-keepalive-count-max` (default: 3)
 
-Timeouts and subprocess failures are logged to stdout/stderr. Once the push phase begins, a `clearsched` or `mansched` failure aborts the run immediately so later channels are not modified after a failed push step.
+Timeouts and subprocess failures are logged to stdout/stderr. If any remote host cannot be reached when its `system.config` is read (just before the push phase), the run aborts without changing any schedule. Once the push phase begins, a `clearsched` or `mansched` failure aborts the run immediately so later channels are not modified after a failed push step.

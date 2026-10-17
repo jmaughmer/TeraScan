@@ -28,8 +28,10 @@ A collection of scripts for controlling and testing TeraScan ground station ante
 
 ## Testing
 
-Run the Python regression tests with:
+Run the regression tests with:
 
 ```bash
 python -m unittest discover -s tests
 ```
+
+The `antenna_move_test.sh` tests run the script with stub `ac`/`bc`/`setqdc` commands, so they need `bash` but no antenna hardware; they are skipped when `bash` is not available.

@@ -59,7 +59,7 @@ Timestamp,Configured Azimuth,Configured Elevation,Actual Azimuth,Actual Elevatio
 
 ### Log file
 
-Written to `~/logs/antenna_move_test-<STAMP>.log`. All `f_log` messages (including command output piped through `tee`) are recorded here. The same messages are also echoed to the terminal.
+Written to `~/logs/antenna_move_test-<STAMP>.log`. All `f_log` messages (including command output piped through `tee`) are recorded here. The same messages are also echoed to the terminal. Error messages are written both to the log and to the terminal's stderr.
 
 ## Behavior
 
@@ -110,7 +110,7 @@ Written to `~/logs/antenna_move_test-<STAMP>.log`. All `f_log` messages (includi
 
 ## Error handling
 
-The script uses `set -o errexit` and `set -o pipefail`, so any unexpected command failure will abort execution immediately. The `die` helper prints a prefixed error message to `stderr` before exiting with a non-zero status.
+The script uses `set -o errexit` and `set -o pipefail`, so any unexpected command failure will abort execution immediately. The `die` helper prints an `ERROR:`-prefixed message to the terminal's `stderr` before exiting with status 1. Errors raised after logging starts (everything except option-parsing errors such as `Missing value for <opt>`) are also recorded in the log file.
 
 Common error messages:
 
