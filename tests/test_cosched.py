@@ -9,6 +9,10 @@ The suite is intentionally split into four groups:
 
 import importlib.util
 import io
+import os
+import shlex
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +29,21 @@ SCHEDULE_WITH_PASS = """#  state  pri  satel    telem       date    day    time 
 """
 HEADER_ONLY_SCHEDULE = "#  state  pri  satel    telem       date    day    time    durat  post_process\n"
 REMOTE_CHAIN_MAP = {"ahrpt": 7}
+PROFILE_PATH = "/opt/terascan/etc/tscan.bash_profile"
+MANSCHED_PATH = "/opt/terascan/bin/mansched"
+
+
+def find_bash():
+    """Return a usable bash path, or None. Skips the WSL launcher on Windows."""
+    bash = shutil.which("bash")
+    if bash and os.name == "nt":
+        windows_dir = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))
+        if os.path.normcase(bash).startswith(windows_dir):
+            return None
+    return bash
+
+
+BASH = find_bash()
 
 
 def load_cosched_module():
@@ -459,7 +478,7 @@ class CoschedMainRoutingTests(unittest.TestCase):
 
     def test_negative_scheduling_params_rejected(self):
         cosched = load_cosched_module()
-        for flag in ["--gap", "--max-trim", "--max-start-delay"]:
+        for flag in ["--gap", "--max-trim", "--max-start-delay", "--remote-batch-secs-per-pass"]:
             with self.subTest(flag=flag):
                 with ExitStack() as stack:
                     stack.enter_context(
@@ -1210,6 +1229,54 @@ class CoschedPushAndIoTests(unittest.TestCase):
         self.assertIn("chain={}".format(cosched.DEFAULT_CHAIN), args)
         self.assertIn("no chain mapping for telemetry 'mystery'", err.getvalue())
 
+    def test_remote_mansched_batch_timeout_scales_with_pass_count(self):
+        # Regression: the whole remote batch shared one --timeout-secs budget, so a
+        # long schedule could time out after clearsched had already emptied the host.
+        cosched = load_cosched_module()
+        passes = [
+            make_pass(cosched, datetime(2099, 1, 1, 12, 10 * i, 0), 120, i + 1, sat="sat-{}".format(i))
+            for i in range(3)
+        ]
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            cosched.push_schedule_to_remote_mansched(passes, "remote-a")
+
+        self.assertEqual(
+            run_mock.call_args[1]["timeout"],
+            cosched.TIMEOUT_SECS + 3 * cosched.REMOTE_BATCH_SECS_PER_PASS,
+        )
+
+    def test_remote_mansched_batch_timeout_error_reports_scaled_timeout(self):
+        cosched = load_cosched_module()
+        scheduled = make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="metop-3")
+        expected_timeout = cosched.TIMEOUT_SECS + cosched.REMOTE_BATCH_SECS_PER_PASS
+        run_mock = Mock(side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=expected_timeout))
+
+        with patch.object(cosched.subprocess, "run", run_mock):
+            with self.assertRaises(RuntimeError) as exc:
+                cosched.push_schedule_to_remote_mansched([scheduled], "remote-a")
+
+        self.assertIn("timed out after {}s on remote-a".format(expected_timeout), str(exc.exception))
+
+    def test_remote_batch_secs_per_pass_option_sets_allowance(self):
+        cosched = load_cosched_module()
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(sys, "argv", ["cosched.py", "input1.sched", "--remote-batch-secs-per-pass", "30"])
+            )
+            stack.enter_context(patch.object(cosched, "parse_schedule", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "dedupe_passes", Mock(return_value=[])))
+            stack.enter_context(patch.object(cosched, "schedule_n_channels", Mock(return_value=([[]], []))))
+            stack.enter_context(patch.object(cosched, "write_schedule", Mock()))
+            stack.enter_context(patch.object(cosched, "clear_tschedule", Mock()))
+            stack.enter_context(patch.object(cosched, "push_schedule_to_mansched", Mock()))
+
+            cosched.main()
+
+        self.assertEqual(cosched.remote_batch_timeout(2), cosched.TIMEOUT_SECS + 60)
+
 
 class CoschedDedupeTests(unittest.TestCase):
     """Verify duplicate selection keeps the intended pass and priority."""
@@ -1247,6 +1314,74 @@ class CoschedDedupeTests(unittest.TestCase):
         self.assertEqual(deduped[0].idx, tied.idx)
         self.assertEqual(deduped[0].dur_s, tied.dur_s)
         self.assertEqual(deduped[0].pri, tied.pri)
+
+
+@unittest.skipIf(BASH is None, "bash is not available")
+class CoschedRemoteBatchScriptTests(unittest.TestCase):
+    """Run the generated remote mansched script in a local bash.
+
+    The TeraScan profile and mansched paths are swapped for temp stubs, so these
+    tests never touch a real TeraScan installation.
+    """
+
+    def run_batch(self, profile_body, mansched_exit):
+        """Run a two-pass batch script; return (process, list of stub mansched calls)."""
+        cosched = load_cosched_module()
+        passes = [
+            make_pass(cosched, datetime(2099, 1, 1, 12, 0, 0), 120, 1, sat="first"),
+            make_pass(cosched, datetime(2099, 1, 1, 12, 30, 0), 120, 2, sat="second"),
+        ]
+        run_mock = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+        with patch.object(cosched.subprocess, "run", run_mock):
+            cosched.push_schedule_to_remote_mansched(passes, "remote-a")
+        script = shlex.split(run_mock.call_args[0][0][-1])[-1]  # bash -lc <script>
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = Path(tmpdir) / "tscan.bash_profile"
+            calls = Path(tmpdir) / "mansched_calls"
+            mansched = Path(tmpdir) / "mansched"
+            profile.write_text(profile_body)
+            mansched.write_text(
+                '#!/bin/sh\necho "$@" >> {}\nexit {}\n'.format(shlex.quote(calls.as_posix()), mansched_exit)
+            )
+            mansched.chmod(0o755)
+            self.assertIn("source " + PROFILE_PATH, script)
+            self.assertIn(MANSCHED_PATH, script)
+            script = script.replace("source " + PROFILE_PATH, "source " + shlex.quote(profile.as_posix()))
+            script = script.replace(MANSCHED_PATH, shlex.quote(mansched.as_posix()))
+            proc = subprocess.run(
+                [BASH, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=60,
+            )
+            call_lines = calls.read_text().splitlines() if calls.exists() else []
+        return proc, call_lines
+
+    def test_batch_stops_before_mansched_when_profile_source_fails(self):
+        # Regression: "source ... && set -e" skipped set -e when sourcing failed,
+        # then ran every mansched line anyway.
+        proc, calls = self.run_batch("return 1\n", mansched_exit=0)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("failed to source", proc.stderr)
+
+    def test_batch_stops_at_first_failing_mansched(self):
+        proc, calls = self.run_batch("# profile stub\n", mansched_exit=3)
+
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("satellite=first", calls[0])
+
+    def test_failing_command_inside_profile_does_not_abort_batch(self):
+        # set -e is enabled only after the profile is sourced, so a failing command
+        # inside an otherwise successful profile must not stop the batch.
+        proc, calls = self.run_batch("false\nexport TSCAN_STUB=1\n", mansched_exit=0)
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

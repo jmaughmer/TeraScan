@@ -49,6 +49,7 @@ Usage (file mode):
         [--gap 190] [--max-trim 180] [--max-start-delay 180] \
         [--timeout-secs 120] [--ssh-connect-timeout 30] \
         [--ssh-keepalive-interval 30] [--ssh-keepalive-count-max 3] \
+        [--remote-batch-secs-per-pass 10] \
         [--remote-host user@host] [--remote-host user@host2] ... \
         [--exclude-sat SAT] [--local-exclude-sat SAT] [--remote-exclude-sat SAT] ... \
         [--sat-priority SAT=PRIORITY] ...
@@ -102,12 +103,15 @@ In both modes:
     written to /tmp/cosched_not_scheduled in the same
   schedule file format.
 - Remote mansched submissions are batched per host into a single SSH session to reduce
-    connection overhead and timeout risk.
+    connection overhead and timeout risk. The batch stops before any mansched runs if
+    the TeraScan profile cannot be sourced, and stops at the first failing mansched.
 
 All subprocess calls (clearsched, mansched, listsched, remote SSH) use
---timeout-secs (default: 120). SSH connection and keepalive behavior are configurable
-with --ssh-connect-timeout, --ssh-keepalive-interval, and
---ssh-keepalive-count-max. Remote commands source
+--timeout-secs (default: 120), except a remote mansched batch: because all of a host's
+mansched calls share one SSH session, it gets --timeout-secs plus
+--remote-batch-secs-per-pass (default: 10) for each pass in the batch. SSH connection
+and keepalive behavior are configurable with --ssh-connect-timeout,
+--ssh-keepalive-interval, and --ssh-keepalive-count-max. Remote commands source
 /opt/terascan/etc/tscan.bash_profile before executing.
 
 Compatible with Python 3.6+ (RHEL 7).
@@ -135,6 +139,7 @@ from typing import List, Dict, Optional, Set, Tuple
 
 HEADER = "#  state  pri  satel    telem       date    day    time    durat  post_process"
 TIMEOUT_SECS = 120  # per subprocess call
+REMOTE_BATCH_SECS_PER_PASS = 10  # extra timeout per pass for a remote mansched batch
 SSH_CONNECT_TIMEOUT = 30
 SSH_SERVER_ALIVE_INTERVAL = 30
 SSH_SERVER_ALIVE_COUNT_MAX = 3
@@ -1124,6 +1129,17 @@ def push_schedule_to_mansched(passes: List[Pass], overrides: Optional[Dict[str, 
             )
 
 
+def remote_batch_timeout(n_passes: int) -> int:
+    """Return the timeout for a remote mansched batch of n_passes.
+
+    The whole batch runs in one SSH session, so a single --timeout-secs budget
+    would be shared by every mansched call and a long schedule could time out
+    after clearsched had already emptied the host. The batch gets the base
+    timeout plus REMOTE_BATCH_SECS_PER_PASS for each pass instead.
+    """
+    return TIMEOUT_SECS + n_passes * REMOTE_BATCH_SECS_PER_PASS
+
+
 def push_schedule_to_remote_mansched(
     passes: List[Pass],
     host: str,
@@ -1156,19 +1172,31 @@ def push_schedule_to_remote_mansched(
             print("No remote passes to schedule; skipping remote mansched.")
             return
 
-        remote_script = "source /opt/terascan/etc/tscan.bash_profile && set -e\n" + "\n".join(remote_lines)
+        # Stop before any mansched runs if the profile cannot be sourced, then enable
+        # errexit so the batch stops at the first failing mansched. set -e comes after
+        # the source so it does not apply to commands inside the TeraScan profile.
+        remote_script = (
+            "source /opt/terascan/etc/tscan.bash_profile || "
+            "{ echo 'failed to source /opt/terascan/etc/tscan.bash_profile' >&2; exit 1; }\n"
+            "set -e\n"
+        ) + "\n".join(remote_lines)
         remote_cmd = "bash -lc " + shlex.quote(remote_script)
         ssh_args = ssh_command(host, remote_cmd)
-        print("Running remote mansched batch for {} pass(es) on {}".format(len(remote_lines), host))
+        batch_timeout = remote_batch_timeout(len(remote_lines))
+        print(
+            "Running remote mansched batch for {} pass(es) on {} (timeout {}s)".format(
+                len(remote_lines), host, batch_timeout
+            )
+        )
         result = subprocess.run(
             ssh_args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
-            timeout=TIMEOUT_SECS,
+            timeout=batch_timeout,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError("remote mansched timed out after {}s on {}".format(TIMEOUT_SECS, host))
+        raise RuntimeError("remote mansched timed out after {}s on {}".format(batch_timeout, host))
     except Exception as e:
         raise RuntimeError("Error running remote mansched: {}".format(e))
 
@@ -1318,7 +1346,7 @@ def write_raw_schedule(label: str, content: str) -> str:
 
 def main():
     global TIMEOUT_SECS, SSH_CONNECT_TIMEOUT, SSH_SERVER_ALIVE_INTERVAL, SSH_SERVER_ALIVE_COUNT_MAX
-    global RUN_RESCHED_BEFORE_LISTSCHED
+    global RUN_RESCHED_BEFORE_LISTSCHED, REMOTE_BATCH_SECS_PER_PASS
     ap = argparse.ArgumentParser(
         description=(
             "Co-schedule satellite pass lists into one or more gap-constrained schedules. "
@@ -1368,6 +1396,15 @@ def main():
     ap.add_argument("--ssh-connect-timeout", type=int, default=SSH_CONNECT_TIMEOUT, help="SSH connection timeout in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-interval", type=int, default=SSH_SERVER_ALIVE_INTERVAL, help="SSH ServerAliveInterval in seconds (default: 30)")
     ap.add_argument("--ssh-keepalive-count-max", type=int, default=SSH_SERVER_ALIVE_COUNT_MAX, help="SSH ServerAliveCountMax (default: 3)")
+    ap.add_argument(
+        "--remote-batch-secs-per-pass",
+        type=int,
+        default=REMOTE_BATCH_SECS_PER_PASS,
+        help=(
+            "Extra timeout in seconds per pass for each remote mansched batch, added to --timeout-secs "
+            "(default: {})".format(REMOTE_BATCH_SECS_PER_PASS)
+        ),
+    )
     ap.add_argument(
         "--remote-host",
         dest="remote_hosts",
@@ -1439,11 +1476,14 @@ def main():
         ap.error("--ssh-keepalive-interval must be > 0")
     if args.ssh_keepalive_count_max <= 0:
         ap.error("--ssh-keepalive-count-max must be > 0")
+    if args.remote_batch_secs_per_pass < 0:
+        ap.error("--remote-batch-secs-per-pass must be >= 0")
 
     TIMEOUT_SECS = args.timeout_secs
     SSH_CONNECT_TIMEOUT = args.ssh_connect_timeout
     SSH_SERVER_ALIVE_INTERVAL = args.ssh_keepalive_interval
     SSH_SERVER_ALIVE_COUNT_MAX = args.ssh_keepalive_count_max
+    REMOTE_BATCH_SECS_PER_PASS = args.remote_batch_secs_per_pass
     RUN_RESCHED_BEFORE_LISTSCHED = not args.no_resched
 
     if args.fetch:

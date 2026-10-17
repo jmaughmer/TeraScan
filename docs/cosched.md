@@ -4,7 +4,7 @@ Merges one or more TeraScan satellite pass schedule files, deduplicates overlapp
 
 Passes whose effective duration would floor or trim to zero seconds are treated as unscheduled and written to `/tmp/cosched_not_scheduled` instead of remaining on an output channel.
 
-Remote scheduling is submitted in a single SSH batch per remote channel to reduce connection overhead and timeout risk on high-latency links.
+Remote scheduling is submitted in a single SSH batch per remote channel to reduce connection overhead and timeout risk on high-latency links. The batch stops before any `mansched` runs if the TeraScan profile cannot be sourced, and stops at the first `mansched` that fails.
 
 ## Dependencies
 
@@ -65,6 +65,7 @@ Output paths in fetch mode follow the source each channel came from, not the cha
 | `--ssh-connect-timeout <int>` | `30` | SSH connection timeout in seconds |
 | `--ssh-keepalive-interval <int>` | `30` | SSH `ServerAliveInterval` in seconds |
 | `--ssh-keepalive-count-max <int>` | `3` | SSH `ServerAliveCountMax` |
+| `--remote-batch-secs-per-pass <int>` | `10` | Extra timeout in seconds per pass for each remote `mansched` batch, added to `--timeout-secs` (must be ≥ 0) |
 | `--remote-host <host>` | — | SSH host for channel 2, 3, … (repeat for each additional channel) |
 | `--exclude-sat <sat>` | — | Exclude a satellite from **all** channels (repeat for multiple) |
 | `--local-exclude-sat <sat>` | — | Exclude a satellite from the local target only (repeat for multiple) |
@@ -240,7 +241,8 @@ python3 cosched.py --fetch \
   --timeout-secs 300 \
   --ssh-connect-timeout 60 \
   --ssh-keepalive-interval 30 \
-  --ssh-keepalive-count-max 5
+  --ssh-keepalive-count-max 5 \
+  --remote-batch-secs-per-pass 20
 ```
 
 ### File mode with custom gap
@@ -295,6 +297,8 @@ python3 cosched.py --fetch \
 ## Subprocess timeouts
 
 All calls to `listsched`, `clearsched`, `mansched`, and remote SSH commands (including reading each remote `system.config`) use `--timeout-secs` (default: 120).
+
+The one exception is the remote `mansched` batch. All of a remote host's passes are loaded in one SSH session, so a single 120-second budget would be shared by every `mansched` call, and a long schedule could time out after `clearsched` had already emptied that host. The batch timeout is therefore `--timeout-secs` + `--remote-batch-secs-per-pass` × number of passes. With the defaults, a 30-pass batch gets 120 + 10 × 30 = 420 seconds. Set `--remote-batch-secs-per-pass 0` to use the fixed `--timeout-secs` budget.
 
 SSH behavior is additionally controlled by:
 
